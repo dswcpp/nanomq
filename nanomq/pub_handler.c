@@ -18,6 +18,10 @@
 #include <libpq-fe.h>
 #endif
 
+#if defined(SUPP_TAOS)
+#include "taos_sink.hpp"
+#endif
+
 
 #include "include/nanomq.h"
 #include "nng/nng.h"
@@ -755,6 +759,7 @@ rule_table_name(rule *r)
     case RULE_FORWORD_MYSQL:       return r->mysql->table;
     case RULE_FORWORD_POSTGRESQL:  return r->postgresql->table;
     case RULE_FORWORD_TIMESCALEDB: return r->timescaledb->table;
+    case RULE_FORWORD_TAOS:        return r->taos->table;
     default: return NULL;
     }
 }
@@ -1223,6 +1228,9 @@ rule_engine_insert_sql(nano_work *work)
 	bool is_need_set_postgresql = false;
 	static bool is_first_time_timescaledb = true;
 	bool is_need_set_timescaledb = false;
+#if defined(SUPP_TAOS)
+	static bool is_taos_started = false;
+#endif
 
 	nng_mtx *rule_mutex = work->config->rule_eng.rule_mutex;
 
@@ -1575,6 +1583,50 @@ rule_engine_insert_sql(nano_work *work)
   				}
 
 				PQclear(res);
+			}
+#endif
+
+#if defined(SUPP_TAOS)
+			if (RULE_ENG_TAOS & work->config->rule_eng.option &&
+			    RULE_FORWORD_TAOS == rules[i].forword_type) {
+				rule_taos *t = rules[i].taos;
+				pub_packet_struct *pp = work->pub_packet;
+				conn_param *cp = work->cparam;
+
+				// 首次触发时启动后台线程
+				if (!is_taos_started) {
+					taos_sink_config cfg;
+					cfg.host     = t->host;
+					cfg.port     = t->port > 0 ? t->port : 6041;
+					cfg.username = t->username;
+					cfg.password = t->password;
+					cfg.db       = t->db;
+					cfg.stable   = t->table;
+
+					if (taos_sink_start(&cfg) != 0) {
+						log_error("taos_sink_start failed");
+						continue;
+					}
+					is_taos_started = true;
+				}
+
+				const char *cid = (const char *) conn_param_get_clientid(cp);
+				const char *usr = (const char *) conn_param_get_username(cp);
+
+				taos_rule_result rr;
+				rr.qos          = pp->fixed_header.qos;
+				rr.packet_id    = pp->var_header.publish.packet_id;
+				rr.topic        = pp->var_header.publish.topic_name.body;
+				rr.client_id    = cid ? cid : "";
+				rr.username     = usr ? usr : "";
+				rr.payload      = pp->payload.data;
+				rr.payload_len  = pp->payload.len;
+				rr.timestamp_ms = (int64_t) time(NULL) * 1000LL;
+
+				// 非阻塞入队，内部深拷贝
+				if (taos_sink_enqueue(&rr) != 0) {
+					log_error("taos_sink_enqueue failed");
+				}
 			}
 #endif
 

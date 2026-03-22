@@ -58,6 +58,10 @@
 #if defined(SUPP_PLUGIN)
 	#include "include/plugin.h"
 #endif
+
+#if defined(SUPP_TAOS)
+	#include "taos_sink.hpp"
+#endif
 // #if defined(SUPP_RULE_ENGINE)
 // 	#include <foundationdb/fdb_c.h>
 // 	#include <foundationdb/fdb_c_options.g.h>
@@ -1388,6 +1392,11 @@ broker(conf *nanomq_conf)
 		}
 	}
 #endif
+
+#if defined(SUPP_TAOS)
+	taos_sink_stop();
+#endif
+
 	return 0;
 }
 

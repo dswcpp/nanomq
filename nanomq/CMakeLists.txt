@@ -110,6 +110,11 @@ if(ENABLE_TIMESCALEDB)
 
 endif(ENABLE_TIMESCALEDB)
 
+if(ENABLE_TAOS)
+  target_sources(nanomq PRIVATE taos_sink.cpp)
+  set_source_files_properties(taos_sink.cpp PROPERTIES LANGUAGE CXX)
+endif(ENABLE_TAOS)
+
 if(ENABLE_AWS_BRIDGE)
   target_link_libraries(nanomq
       aws_iot_mqtt
