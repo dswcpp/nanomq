@@ -1234,6 +1234,9 @@ rule_engine_insert_sql(nano_work *work)
 
 	nng_mtx *rule_mutex = work->config->rule_eng.rule_mutex;
 
+	log_info("rule_engine: rule_size=%zu, option=0x%x, RULE_ENG_TAOS=0x%x",
+		rule_size, work->config->rule_eng.option, RULE_ENG_TAOS);
+
 	for (size_t i = 0; i < rule_size; i++) {
 		if (true == rules[i].enabled && rule_engine_filter(work, &rules[i])) {
 #if defined(FDB_SUPPORT)
@@ -1589,6 +1592,7 @@ rule_engine_insert_sql(nano_work *work)
 #if defined(SUPP_TAOS)
 			if (RULE_ENG_TAOS & work->config->rule_eng.option &&
 			    RULE_FORWORD_TAOS == rules[i].forword_type) {
+				log_info("taos_sink: rule matched!");
 				rule_taos *t = rules[i].taos;
 				pub_packet_struct *pp = work->pub_packet;
 				conn_param *cp = work->cparam;

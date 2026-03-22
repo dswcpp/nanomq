@@ -632,9 +632,13 @@ server_cb(void *arg)
 		}
 		break;
 	case SEND:
+		log_warn("SEND state entered, ctx%d", work->ctx.id);
 		log_debug("SEND ^^^^ ctx%d ^^^^", work->ctx.id);
 #if defined(SUPP_RULE_ENGINE)
+		log_warn("broker: flag=%d, option=0x%x, RULE_ENG_OFF=%d",
+			work->flag, work->config->rule_eng.option, RULE_ENG_OFF);
 		if (work->flag == CMD_PUBLISH && work->config->rule_eng.option != RULE_ENG_OFF) {
+			log_warn("broker: calling rule_engine_insert_sql");
 			rule_engine_insert_sql(work);
 		}
 #endif
