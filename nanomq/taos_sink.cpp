@@ -453,7 +453,10 @@ static char *build_batch_insert_sql(taos_queued_item *items, size_t count,
 
         size_t total_esc = esc_cid_sz + esc_topic_sz + esc_uname_sz + hex_size;
         char *esc_buf = (char *) calloc(1, total_esc);
-        if (!esc_buf) continue;
+        if (!esc_buf) {
+            free(sql.data);
+            return NULL;
+        }
 
         char *esc_cid   = esc_buf;
         char *esc_topic = esc_cid + esc_cid_sz;
@@ -473,7 +476,11 @@ static char *build_batch_insert_sql(taos_queued_item *items, size_t count,
                         + strlen(stable) + esc_cid_sz + esc_topic_sz
                         + esc_uname_sz + hex_size + 256;
         char *frag = (char *) malloc(frag_est);
-        if (!frag) { free(esc_buf); continue; }
+        if (!frag) {
+            free(esc_buf);
+            free(sql.data);
+            return NULL;
+        }
 
         int frag_len = snprintf(frag, frag_est,
             "%s.%s USING %s.%s TAGS('%s') "
@@ -627,13 +634,27 @@ static int taos_sink_init_db(const char *url, const char *auth_hdr,
 
 // ---------- 公共接口 ----------
 
+static int taos_sink_same_target(const taos_sink_config *cfg)
+{
+    if (!cfg || !g_taos.db || !g_taos.stable) {
+        return 0;
+    }
+
+    return strcmp(g_taos.db, cfg->db) == 0 &&
+           strcmp(g_taos.stable, cfg->stable) == 0;
+}
+
 int taos_sink_start(const taos_sink_config *cfg)
 {
     std::lock_guard<std::mutex> guard(g_taos_start_mtx);
 
     if (g_taos.started) {
-        log_warn("taos_sink: already started, ignoring duplicate start");
-        return 0;
+        if (taos_sink_same_target(cfg)) {
+            log_warn("taos_sink: already started, ignoring duplicate start");
+            return 0;
+        }
+        log_error("taos_sink: already started with different target");
+        return -1;
     }
 
     if (!cfg || !cfg->host || !cfg->db || !cfg->stable) {
@@ -670,8 +691,11 @@ int taos_sink_start(const taos_sink_config *cfg)
 
     g_taos.db      = safe_strdup(cfg->db);
     g_taos.stable  = safe_strdup(cfg->stable);
+    if (!g_taos.db || !g_taos.stable) {
+        taos_sink_reset_partial_state();
+        return -1;
+    }
     taos_queue_init(&g_taos.queue);
-    g_taos.running = true;
 
     // 建库建表
     if (taos_sink_init_db(g_taos.url, g_taos.auth_header,
@@ -679,6 +703,8 @@ int taos_sink_start(const taos_sink_config *cfg)
         taos_sink_reset_partial_state();
         return -1;
     }
+
+    g_taos.running = true;
 
     // 创建同步原语
     int rv;
@@ -713,7 +739,20 @@ int taos_sink_start(const taos_sink_config *cfg)
 
 int taos_sink_enqueue(const taos_rule_result *result)
 {
-    if (!result || !g_taos.started) return -1;
+    if (!result) return -1;
+
+    nng_mtx *mtx = NULL;
+    nng_cv  *cv  = NULL;
+    bool     started = false;
+
+    {
+        std::lock_guard<std::mutex> guard(g_taos_start_mtx);
+        started = g_taos.started;
+        mtx     = g_taos.mtx;
+        cv      = g_taos.cv;
+    }
+
+    if (!started || !mtx || !cv) return -1;
 
     taos_queued_item item;
     if (taos_item_deep_copy(&item, result) != 0) {
@@ -722,13 +761,13 @@ int taos_sink_enqueue(const taos_rule_result *result)
     }
 
     int rv = 0;
-    nng_mtx_lock(g_taos.mtx);
+    nng_mtx_lock(mtx);
     if (taos_queue_push(&g_taos.queue, &item) != 0) {
         rv = -1;
     } else if (g_taos.queue.len >= TAOS_BATCH_SIZE) {
-        nng_cv_wake(g_taos.cv);
+        nng_cv_wake(cv);
     }
-    nng_mtx_unlock(g_taos.mtx);
+    nng_mtx_unlock(mtx);
 
     if (rv != 0) {
         taos_item_free(&item);
