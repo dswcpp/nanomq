@@ -14,7 +14,7 @@ endif(DEBUG AND TSAN)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/dds2mqtt)
-include_directories(${CMAKE_SOURCE_DIR}/nng/include/nng)
+include_directories(${NANOMQ_NNG_SOURCE_DIR}/include/nng)
 
 file(GLOB CLI_SOURCE "*.c")
 
@@ -96,4 +96,3 @@ add_dependencies(nanomq_cli nng)
 
 install(TARGETS nanomq_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
                                    COMPONENT Tools)
-

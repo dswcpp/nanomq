@@ -378,7 +378,17 @@ if (ENABLE_TAOS)
   add_definitions(-DSUPP_TAOS)
 endif (ENABLE_TAOS)
 
-add_subdirectory(nng)
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/nng/CMakeLists.txt")
+  set(NANOMQ_NNG_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nng")
+  set(NANOMQ_NNG_BINARY_DIR "${CMAKE_BINARY_DIR}/nng")
+elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/NanoNNG/CMakeLists.txt")
+  set(NANOMQ_NNG_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/NanoNNG")
+  set(NANOMQ_NNG_BINARY_DIR "${CMAKE_BINARY_DIR}/NanoNNG")
+else ()
+  message(FATAL_ERROR "Neither nng/ nor NanoNNG/ contains a valid CMakeLists.txt")
+endif ()
+
+add_subdirectory(${NANOMQ_NNG_SOURCE_DIR} ${NANOMQ_NNG_BINARY_DIR})
 add_subdirectory(nanomq)
 
 add_dependencies(nanomq nng)
