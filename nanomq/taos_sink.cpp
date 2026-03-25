@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <ctype.h>
+#include <mutex>
 
 #include "nng/nng.h"
 #include "nng/supplemental/http/http.h"
@@ -42,17 +43,18 @@ static void taos_queue_init(taos_queue_t *q)
     q->cap  = 0;
 }
 
-static void taos_queue_push(taos_queue_t *q, const taos_queued_item *item)
+static int taos_queue_push(taos_queue_t *q, const taos_queued_item *item)
 {
     if (q->len >= q->cap) {
         size_t new_cap = q->cap ? q->cap * 2 : 16;
         taos_queued_item *p = (taos_queued_item *) realloc(
             q->data, new_cap * sizeof(taos_queued_item));
-        if (!p) return;
+        if (!p) return -1;
         q->data = p;
         q->cap  = new_cap;
     }
     q->data[q->len++] = *item;
+    return 0;
 }
 
 static void taos_queue_remove_front(taos_queue_t *q, size_t count)
@@ -97,10 +99,11 @@ static char *base64_encode(const char *src, size_t src_len)
     }
     if (i < src_len) {
         unsigned char a = (unsigned char) src[i++];
-        unsigned char b = (i < src_len) ? (unsigned char) src[i++] : 0;
+        bool has_second_byte = i < src_len;
+        unsigned char b = has_second_byte ? (unsigned char) src[i++] : 0;
         out[j++] = b64_table[a >> 2];
         out[j++] = b64_table[((a & 0x03) << 4) | (b >> 4)];
-        out[j++] = (i == src_len + 1) ? '=' : b64_table[(b & 0x0F) << 2];
+        out[j++] = has_second_byte ? b64_table[(b & 0x0F) << 2] : '=';
         out[j++] = '=';
     }
     out[j] = '\0';
@@ -293,16 +296,41 @@ static char *safe_strdup(const char *s)
     return d;
 }
 
-static void taos_item_deep_copy(taos_queued_item *dst, const taos_rule_result *src)
+static void taos_item_free(taos_queued_item *item)
 {
+    free(item->topic);
+    free(item->client_id);
+    free(item->username);
+    free(item->payload);
+}
+
+static int taos_item_deep_copy(taos_queued_item *dst, const taos_rule_result *src)
+{
+    memset(dst, 0, sizeof(*dst));
+
     dst->qos          = src->qos;
     dst->packet_id    = src->packet_id;
-    dst->topic        = safe_strdup(src->topic);
-    dst->client_id    = safe_strdup(src->client_id);
-    dst->username     = safe_strdup(src->username);
     dst->timestamp_ms = src->timestamp_ms > 0
                             ? src->timestamp_ms
                             : (int64_t) time(NULL) * 1000LL;
+
+    dst->topic = safe_strdup(src->topic);
+    if (src->topic && !dst->topic) {
+        taos_item_free(dst);
+        return -1;
+    }
+
+    dst->client_id = safe_strdup(src->client_id);
+    if (src->client_id && !dst->client_id) {
+        taos_item_free(dst);
+        return -1;
+    }
+
+    dst->username = safe_strdup(src->username);
+    if (src->username && !dst->username) {
+        taos_item_free(dst);
+        return -1;
+    }
 
     if (src->payload && src->payload_len > 0) {
         size_t copy_len = src->payload_len < 1024 ? src->payload_len : 1024;
@@ -311,22 +339,15 @@ static void taos_item_deep_copy(taos_queued_item *dst, const taos_rule_result *s
                      src->payload_len);
         }
         dst->payload = (char *) malloc(copy_len);
-        if (dst->payload) {
-            memcpy(dst->payload, src->payload, copy_len);
+        if (!dst->payload) {
+            taos_item_free(dst);
+            return -1;
         }
+        memcpy(dst->payload, src->payload, copy_len);
         dst->payload_len = copy_len;
-    } else {
-        dst->payload     = NULL;
-        dst->payload_len = 0;
     }
-}
 
-static void taos_item_free(taos_queued_item *item)
-{
-    free(item->topic);
-    free(item->client_id);
-    free(item->username);
-    free(item->payload);
+    return 0;
 }
 
 // ---------- 全局 sink 状态 ----------
@@ -345,6 +366,26 @@ static struct {
     bool         running;
     bool         started;    // 防止 double-start/stop
 } g_taos;
+
+static std::mutex g_taos_start_mtx;
+
+static void taos_sink_reset_partial_state(void)
+{
+    taos_queue_free(&g_taos.queue);
+    free(g_taos.url);
+    free(g_taos.auth_header);
+    free(g_taos.db);
+    free(g_taos.stable);
+    g_taos.url         = NULL;
+    g_taos.auth_header = NULL;
+    g_taos.db          = NULL;
+    g_taos.stable      = NULL;
+    g_taos.mtx         = NULL;
+    g_taos.cv          = NULL;
+    g_taos.thread      = NULL;
+    g_taos.running     = false;
+    g_taos.started     = false;
+}
 
 // ---------- 子表名生成 ----------
 
@@ -565,27 +606,31 @@ static int taos_sink_init_db(const char *url, const char *auth_hdr,
         "ts TIMESTAMP,"
         "qos INT,"
         "packet_id INT,"
-        "topic NCHAR(256),"
-        "username NCHAR(256),"
-        "payload NCHAR(2048)"
+        "topic_name NCHAR(256),"
+        "user_name NCHAR(256),"
+        "payload_text NCHAR(2048)"
         ") TAGS (client_id NCHAR(128))",
         db, stable);
 
-    if (tdengine_exec(url, auth_hdr, sql) != 0) {
-        log_error("taos_sink: create stable failed");
-        free(sql);
-        return -1;
+    for (int i = 0; i < 20; i++) {
+        if (tdengine_exec(url, auth_hdr, sql) == 0) {
+            free(sql);
+            log_info("taos_sink: init ok: %s.%s", db, stable);
+            return 0;
+        }
+        nng_msleep(100);
     }
     free(sql);
-
-    log_info("taos_sink: init ok: %s.%s", db, stable);
-    return 0;
+    log_error("taos_sink: create stable failed");
+    return -1;
 }
 
 // ---------- 公共接口 ----------
 
 int taos_sink_start(const taos_sink_config *cfg)
 {
+    std::lock_guard<std::mutex> guard(g_taos_start_mtx);
+
     if (g_taos.started) {
         log_warn("taos_sink: already started, ignoring duplicate start");
         return 0;
@@ -619,6 +664,7 @@ int taos_sink_start(const taos_sink_config *cfg)
     g_taos.auth_header = build_auth_header(user, pass);
     if (!g_taos.auth_header) {
         free(g_taos.url);
+        g_taos.url = NULL;
         return -1;
     }
 
@@ -630,10 +676,7 @@ int taos_sink_start(const taos_sink_config *cfg)
     // 建库建表
     if (taos_sink_init_db(g_taos.url, g_taos.auth_header,
                           g_taos.db, g_taos.stable) != 0) {
-        free(g_taos.url);
-        free(g_taos.auth_header);
-        free(g_taos.db);
-        free(g_taos.stable);
+        taos_sink_reset_partial_state();
         return -1;
     }
 
@@ -641,11 +684,14 @@ int taos_sink_start(const taos_sink_config *cfg)
     int rv;
     if ((rv = nng_mtx_alloc(&g_taos.mtx)) != 0) {
         log_error("taos_sink: nng_mtx_alloc: %s", nng_strerror(rv));
+        taos_sink_reset_partial_state();
         return -1;
     }
     if ((rv = nng_cv_alloc(&g_taos.cv, g_taos.mtx)) != 0) {
         log_error("taos_sink: nng_cv_alloc: %s", nng_strerror(rv));
         nng_mtx_free(g_taos.mtx);
+        g_taos.mtx = NULL;
+        taos_sink_reset_partial_state();
         return -1;
     }
 
@@ -654,6 +700,9 @@ int taos_sink_start(const taos_sink_config *cfg)
         log_error("taos_sink: nng_thread_create: %s", nng_strerror(rv));
         nng_cv_free(g_taos.cv);
         nng_mtx_free(g_taos.mtx);
+        g_taos.cv = NULL;
+        g_taos.mtx = NULL;
+        taos_sink_reset_partial_state();
         return -1;
     }
 
@@ -667,20 +716,39 @@ int taos_sink_enqueue(const taos_rule_result *result)
     if (!result || !g_taos.started) return -1;
 
     taos_queued_item item;
-    taos_item_deep_copy(&item, result);
+    if (taos_item_deep_copy(&item, result) != 0) {
+        log_error("taos_sink: deep copy failed");
+        return -1;
+    }
 
+    int rv = 0;
     nng_mtx_lock(g_taos.mtx);
-    taos_queue_push(&g_taos.queue, &item);
-    if (g_taos.queue.len >= TAOS_BATCH_SIZE) {
+    if (taos_queue_push(&g_taos.queue, &item) != 0) {
+        rv = -1;
+    } else if (g_taos.queue.len >= TAOS_BATCH_SIZE) {
         nng_cv_wake(g_taos.cv);
     }
     nng_mtx_unlock(g_taos.mtx);
 
+    if (rv != 0) {
+        taos_item_free(&item);
+        log_error("taos_sink: queue push failed");
+        return -1;
+    }
+
     return 0;
+}
+
+int taos_sink_is_started(void)
+{
+    std::lock_guard<std::mutex> guard(g_taos_start_mtx);
+    return g_taos.started ? 1 : 0;
 }
 
 void taos_sink_stop(void)
 {
+    std::lock_guard<std::mutex> guard(g_taos_start_mtx);
+
     if (!g_taos.started) {
         return;
     }
@@ -717,6 +785,7 @@ void taos_sink_stop(void)
     g_taos.mtx         = NULL;
     g_taos.cv          = NULL;
     g_taos.thread      = NULL;
+    g_taos.running     = false;
 
     log_info("taos_sink: stopped");
 }

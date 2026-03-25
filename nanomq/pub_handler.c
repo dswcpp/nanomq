@@ -1228,9 +1228,6 @@ rule_engine_insert_sql(nano_work *work)
 	bool is_need_set_postgresql = false;
 	static bool is_first_time_timescaledb = true;
 	bool is_need_set_timescaledb = false;
-#if defined(SUPP_TAOS)
-	static bool is_taos_started = false;
-#endif
 
 	nng_mtx *rule_mutex = work->config->rule_eng.rule_mutex;
 
@@ -1597,8 +1594,7 @@ rule_engine_insert_sql(nano_work *work)
 				pub_packet_struct *pp = work->pub_packet;
 				conn_param *cp = work->cparam;
 
-				// 首次触发时启动后台线程
-				if (!is_taos_started) {
+				if (!taos_sink_is_started()) {
 					taos_sink_config cfg;
 					cfg.host     = t->host;
 					cfg.port     = t->port > 0 ? t->port : 6041;
@@ -1611,7 +1607,6 @@ rule_engine_insert_sql(nano_work *work)
 						log_error("taos_sink_start failed");
 						continue;
 					}
-					is_taos_started = true;
 				}
 
 				const char *cid = (const char *) conn_param_get_clientid(cp);

@@ -43,6 +43,9 @@ int taos_sink_start(const taos_sink_config *cfg);
 // 返回 0 成功，非 0 失败
 int taos_sink_enqueue(const taos_rule_result *result);
 
+// 返回 1 已启动，0 未启动
+int taos_sink_is_started(void);
+
 // 停止 sink 后台线程并 flush 剩余数据（broker 关闭时调用）
 void taos_sink_stop(void);
 
