@@ -33,8 +33,13 @@
 *.su
 .idea/
 .vscode/
+.claude/
 build/
+build-cmake-*/
 cmake-build-debug/
+
+# Local dependency worktrees / clones
+NanoNNG/
 
 .DS_Store
 
