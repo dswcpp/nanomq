@@ -24,6 +24,7 @@ typedef struct {
     char    *client_id;
     char    *username;
     char    *payload;
+    char    *stable;
     size_t   payload_len;
     int64_t  timestamp_ms;
 } taos_queued_item;
@@ -302,9 +303,12 @@ static void taos_item_free(taos_queued_item *item)
     free(item->client_id);
     free(item->username);
     free(item->payload);
+    free(item->stable);
 }
 
-static int taos_item_deep_copy(taos_queued_item *dst, const taos_rule_result *src)
+static int
+taos_item_deep_copy(taos_queued_item *dst, const taos_rule_result *src,
+    const char *stable)
 {
     memset(dst, 0, sizeof(*dst));
 
@@ -328,6 +332,12 @@ static int taos_item_deep_copy(taos_queued_item *dst, const taos_rule_result *sr
 
     dst->username = safe_strdup(src->username);
     if (src->username && !dst->username) {
+        taos_item_free(dst);
+        return -1;
+    }
+
+    dst->stable = safe_strdup(stable);
+    if (stable && !dst->stable) {
         taos_item_free(dst);
         return -1;
     }
@@ -356,7 +366,9 @@ static struct {
     char       *url;         // "http://host:port/rest/sql"
     char       *auth_header; // "Basic <base64>"
     char       *db;
-    char       *stable;
+    char      **stables;
+    size_t      stable_count;
+    size_t      stable_cap;
 
     nng_mtx    *mtx;
     nng_cv     *cv;
@@ -375,11 +387,18 @@ static void taos_sink_reset_partial_state(void)
     free(g_taos.url);
     free(g_taos.auth_header);
     free(g_taos.db);
-    free(g_taos.stable);
+    if (g_taos.stables != NULL) {
+        for (size_t i = 0; i < g_taos.stable_count; i++) {
+            free(g_taos.stables[i]);
+        }
+        free(g_taos.stables);
+    }
     g_taos.url         = NULL;
     g_taos.auth_header = NULL;
     g_taos.db          = NULL;
-    g_taos.stable      = NULL;
+    g_taos.stables     = NULL;
+    g_taos.stable_count = 0;
+    g_taos.stable_cap   = 0;
     g_taos.mtx         = NULL;
     g_taos.cv          = NULL;
     g_taos.thread      = NULL;
@@ -421,8 +440,8 @@ static void dyn_buf_init(dyn_buf *b)
 
 // ---------- 批量 INSERT SQL 构造 ----------
 
-static char *build_batch_insert_sql(taos_queued_item *items, size_t count,
-                                    const char *db, const char *stable)
+static char *
+build_batch_insert_sql(taos_queued_item *items, size_t count, const char *db)
 {
     size_t est = 256 + count * 2048;
     dyn_buf sql;
@@ -438,6 +457,12 @@ static char *build_batch_insert_sql(taos_queued_item *items, size_t count,
 
     for (size_t i = 0; i < count; i++) {
         taos_queued_item *item = &items[i];
+        const char       *stable = item->stable;
+
+        if (stable == NULL || stable[0] == '\0') {
+            free(sql.data);
+            return NULL;
+        }
 
         char sub_table[192];
         make_sub_table(sub_table, sizeof(sub_table), stable, item->client_id);
@@ -472,9 +497,9 @@ static char *build_batch_insert_sql(taos_queued_item *items, size_t count,
         }
 
         // 动态构造单条记录片段（避免栈缓冲区截断）
-        size_t frag_est = strlen(db) * 2 + sizeof(sub_table)
-                        + strlen(stable) + esc_cid_sz + esc_topic_sz
-                        + esc_uname_sz + hex_size + 256;
+        size_t frag_est = strlen(db) * 2 + sizeof(sub_table) + strlen(stable) +
+                          esc_cid_sz + esc_topic_sz + esc_uname_sz + hex_size +
+                          256;
         char *frag = (char *) malloc(frag_est);
         if (!frag) {
             free(esc_buf);
@@ -521,8 +546,7 @@ static void taos_sink_flush(taos_queued_item *items, size_t count)
 {
     if (count == 0) return;
 
-    char *sql = build_batch_insert_sql(items, count,
-                                       g_taos.db, g_taos.stable);
+    char *sql = build_batch_insert_sql(items, count, g_taos.db);
     if (!sql) {
         log_error("taos_sink: build batch sql failed");
         return;
@@ -632,31 +656,118 @@ static int taos_sink_init_db(const char *url, const char *auth_hdr,
     return -1;
 }
 
+typedef int (*taos_sink_init_db_fn)(
+    const char *url, const char *auth_hdr, const char *db, const char *stable);
+
+static taos_sink_init_db_fn g_taos_init_db_fn = taos_sink_init_db;
+
 // ---------- 公共接口 ----------
 
-static int taos_sink_same_target(const taos_sink_config *cfg)
+static int taos_sink_effective_port(const taos_sink_config *cfg)
 {
-    if (!cfg || !g_taos.db || !g_taos.stable) {
+    return (cfg != NULL && cfg->port > 0) ? cfg->port : 6041;
+}
+
+static const char *taos_sink_effective_username(const taos_sink_config *cfg)
+{
+    return (cfg != NULL && cfg->username != NULL) ? cfg->username : "root";
+}
+
+static const char *taos_sink_effective_password(const taos_sink_config *cfg)
+{
+    return (cfg != NULL && cfg->password != NULL) ? cfg->password : "taosdata";
+}
+
+static bool taos_sink_has_stable(const char *stable)
+{
+    if (stable == NULL) {
+        return false;
+    }
+
+    for (size_t i = 0; i < g_taos.stable_count; i++) {
+        if (strcmp(g_taos.stables[i], stable) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int taos_sink_add_stable(const char *stable)
+{
+    if (stable == NULL || taos_sink_has_stable(stable)) {
         return 0;
     }
 
-    return strcmp(g_taos.db, cfg->db) == 0 &&
-           strcmp(g_taos.stable, cfg->stable) == 0;
-}
-
-int taos_sink_start(const taos_sink_config *cfg)
-{
-    std::lock_guard<std::mutex> guard(g_taos_start_mtx);
-
-    if (g_taos.started) {
-        if (taos_sink_same_target(cfg)) {
-            log_warn("taos_sink: already started, ignoring duplicate start");
-            return 0;
+    if (g_taos.stable_count >= g_taos.stable_cap) {
+        size_t new_cap = g_taos.stable_cap ? g_taos.stable_cap * 2 : 4;
+        char **new_stables = (char **) realloc(
+            g_taos.stables, new_cap * sizeof(char *));
+        if (new_stables == NULL) {
+            return -1;
         }
-        log_error("taos_sink: already started with different target");
-        return -1;
+        g_taos.stables = new_stables;
+        g_taos.stable_cap = new_cap;
     }
 
+    g_taos.stables[g_taos.stable_count] = safe_strdup(stable);
+    if (g_taos.stables[g_taos.stable_count] == NULL) {
+        return -1;
+    }
+    g_taos.stable_count++;
+    return 0;
+}
+
+static int taos_sink_ensure_stable_ready(const char *stable)
+{
+    if (stable == NULL) {
+        return -1;
+    }
+    if (taos_sink_has_stable(stable)) {
+        return 0;
+    }
+    if (g_taos.url == NULL || g_taos.auth_header == NULL || g_taos.db == NULL) {
+        return -1;
+    }
+    if (g_taos_init_db_fn(g_taos.url, g_taos.auth_header, g_taos.db, stable) !=
+        0) {
+        return -1;
+    }
+    return taos_sink_add_stable(stable);
+}
+
+static int taos_sink_same_connection_target(const taos_sink_config *cfg)
+{
+    if (!cfg || !cfg->host || !cfg->db || !g_taos.url || !g_taos.auth_header ||
+        !g_taos.db) {
+        return 0;
+    }
+
+    size_t url_len = strlen(cfg->host) + 32;
+    char  *url = (char *) malloc(url_len);
+    if (url == NULL) {
+        return 0;
+    }
+    snprintf(
+        url, url_len, "http://%s:%d/rest/sql", cfg->host, taos_sink_effective_port(cfg));
+
+    char *auth_header = build_auth_header(taos_sink_effective_username(cfg),
+                                          taos_sink_effective_password(cfg));
+    if (auth_header == NULL) {
+        free(url);
+        return 0;
+    }
+
+    int same = strcmp(g_taos.url, url) == 0 &&
+               strcmp(g_taos.auth_header, auth_header) == 0 &&
+               strcmp(g_taos.db, cfg->db) == 0;
+
+    free(auth_header);
+    free(url);
+    return same;
+}
+
+static int taos_sink_validate_config(const taos_sink_config *cfg)
+{
     if (!cfg || !cfg->host || !cfg->db || !cfg->stable) {
         log_error("taos_sink: invalid config");
         return -1;
@@ -670,43 +781,60 @@ int taos_sink_start(const taos_sink_config *cfg)
         log_error("taos_sink: invalid stable name: %s", cfg->stable);
         return -1;
     }
+    return 0;
+}
 
-    int port = cfg->port > 0 ? cfg->port : 6041;
-    const char *user = cfg->username ? cfg->username : "root";
-    const char *pass = cfg->password ? cfg->password : "taosdata";
+static int taos_sink_start_locked(const taos_sink_config *cfg)
+{
+    if (taos_sink_validate_config(cfg) != 0) {
+        return -1;
+    }
 
-    // 构造 URL
+    if (g_taos.started) {
+        if (!taos_sink_same_connection_target(cfg)) {
+            log_error(
+                "taos_sink: already started with different host/port/db/credentials");
+            return -1;
+        }
+        if (taos_sink_ensure_stable_ready(cfg->stable) != 0) {
+            log_error("taos_sink: failed to initialize stable: %s", cfg->stable);
+            return -1;
+        }
+        return 0;
+    }
+
+    int         port = taos_sink_effective_port(cfg);
+    const char *user = taos_sink_effective_username(cfg);
+    const char *pass = taos_sink_effective_password(cfg);
+
     size_t url_len = strlen(cfg->host) + 32;
     g_taos.url = (char *) malloc(url_len);
-    if (!g_taos.url) return -1;
+    if (g_taos.url == NULL) {
+        return -1;
+    }
     snprintf(g_taos.url, url_len, "http://%s:%d/rest/sql", cfg->host, port);
 
-    // 构造 Authorization header
     g_taos.auth_header = build_auth_header(user, pass);
-    if (!g_taos.auth_header) {
+    if (g_taos.auth_header == NULL) {
         free(g_taos.url);
         g_taos.url = NULL;
         return -1;
     }
 
-    g_taos.db      = safe_strdup(cfg->db);
-    g_taos.stable  = safe_strdup(cfg->stable);
-    if (!g_taos.db || !g_taos.stable) {
+    g_taos.db = safe_strdup(cfg->db);
+    if (g_taos.db == NULL) {
         taos_sink_reset_partial_state();
         return -1;
     }
     taos_queue_init(&g_taos.queue);
 
-    // 建库建表
-    if (taos_sink_init_db(g_taos.url, g_taos.auth_header,
-                          g_taos.db, g_taos.stable) != 0) {
+    if (taos_sink_ensure_stable_ready(cfg->stable) != 0) {
         taos_sink_reset_partial_state();
         return -1;
     }
 
     g_taos.running = true;
 
-    // 创建同步原语
     int rv;
     if ((rv = nng_mtx_alloc(&g_taos.mtx)) != 0) {
         log_error("taos_sink: nng_mtx_alloc: %s", nng_strerror(rv));
@@ -721,8 +849,8 @@ int taos_sink_start(const taos_sink_config *cfg)
         return -1;
     }
 
-    // 启动消费者线程
-    if ((rv = nng_thread_create(&g_taos.thread, taos_sink_flush_thread, NULL)) != 0) {
+    if ((rv = nng_thread_create(&g_taos.thread, taos_sink_flush_thread, NULL)) !=
+        0) {
         log_error("taos_sink: nng_thread_create: %s", nng_strerror(rv));
         nng_cv_free(g_taos.cv);
         nng_mtx_free(g_taos.mtx);
@@ -737,37 +865,28 @@ int taos_sink_start(const taos_sink_config *cfg)
     return 0;
 }
 
-int taos_sink_enqueue(const taos_rule_result *result)
+static int taos_sink_enqueue_locked(
+    const taos_rule_result *result, const char *stable)
 {
-    if (!result) return -1;
-
-    nng_mtx *mtx = NULL;
-    nng_cv  *cv  = NULL;
-    bool     started = false;
-
-    {
-        std::lock_guard<std::mutex> guard(g_taos_start_mtx);
-        started = g_taos.started;
-        mtx     = g_taos.mtx;
-        cv      = g_taos.cv;
+    if (!g_taos.started || g_taos.mtx == NULL || g_taos.cv == NULL ||
+        stable == NULL) {
+        return -1;
     }
 
-    if (!started || !mtx || !cv) return -1;
-
     taos_queued_item item;
-    if (taos_item_deep_copy(&item, result) != 0) {
+    if (taos_item_deep_copy(&item, result, stable) != 0) {
         log_error("taos_sink: deep copy failed");
         return -1;
     }
 
     int rv = 0;
-    nng_mtx_lock(mtx);
+    nng_mtx_lock(g_taos.mtx);
     if (taos_queue_push(&g_taos.queue, &item) != 0) {
         rv = -1;
     } else if (g_taos.queue.len >= TAOS_BATCH_SIZE) {
-        nng_cv_wake(cv);
+        nng_cv_wake(g_taos.cv);
     }
-    nng_mtx_unlock(mtx);
+    nng_mtx_unlock(g_taos.mtx);
 
     if (rv != 0) {
         taos_item_free(&item);
@@ -778,13 +897,45 @@ int taos_sink_enqueue(const taos_rule_result *result)
     return 0;
 }
 
+int taos_sink_start(const taos_sink_config *cfg)
+{
+    std::lock_guard<std::mutex> guard(g_taos_start_mtx);
+    return taos_sink_start_locked(cfg);
+}
+
+int taos_sink_enqueue(const taos_rule_result *result)
+{
+    if (result == NULL) {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> guard(g_taos_start_mtx);
+    const char *stable =
+        (g_taos.stable_count > 0) ? g_taos.stables[g_taos.stable_count - 1] : NULL;
+    return taos_sink_enqueue_locked(result, stable);
+}
+
+int taos_sink_enqueue_with_config(
+    const taos_sink_config *cfg, const taos_rule_result *result)
+{
+    if (cfg == NULL || result == NULL) {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> guard(g_taos_start_mtx);
+    if (taos_sink_start_locked(cfg) != 0) {
+        return -1;
+    }
+    return taos_sink_enqueue_locked(result, cfg->stable);
+}
+
 int taos_sink_is_started(void)
 {
     std::lock_guard<std::mutex> guard(g_taos_start_mtx);
     return g_taos.started ? 1 : 0;
 }
 
-void taos_sink_stop(void)
+void taos_sink_stop_all(void)
 {
     std::lock_guard<std::mutex> guard(g_taos_start_mtx);
 
@@ -800,7 +951,6 @@ void taos_sink_stop(void)
 
     nng_thread_destroy(g_taos.thread);
 
-    // 线程已退出，此时不会有并发访问队列
     if (g_taos.queue.len > 0) {
         taos_sink_flush(g_taos.queue.data, g_taos.queue.len);
         for (size_t i = 0; i < g_taos.queue.len; i++) {
@@ -815,16 +965,28 @@ void taos_sink_stop(void)
     free(g_taos.url);
     free(g_taos.auth_header);
     free(g_taos.db);
-    free(g_taos.stable);
+    if (g_taos.stables != NULL) {
+        for (size_t i = 0; i < g_taos.stable_count; i++) {
+            free(g_taos.stables[i]);
+        }
+        free(g_taos.stables);
+    }
 
-    g_taos.url         = NULL;
-    g_taos.auth_header = NULL;
-    g_taos.db          = NULL;
-    g_taos.stable      = NULL;
-    g_taos.mtx         = NULL;
-    g_taos.cv          = NULL;
-    g_taos.thread      = NULL;
-    g_taos.running     = false;
+    g_taos.url          = NULL;
+    g_taos.auth_header  = NULL;
+    g_taos.db           = NULL;
+    g_taos.stables      = NULL;
+    g_taos.stable_count = 0;
+    g_taos.stable_cap   = 0;
+    g_taos.mtx          = NULL;
+    g_taos.cv           = NULL;
+    g_taos.thread       = NULL;
+    g_taos.running      = false;
 
     log_info("taos_sink: stopped");
+}
+
+void taos_sink_stop(void)
+{
+    taos_sink_stop_all();
 }

@@ -33,8 +33,7 @@ typedef struct {
 // 返回 1 合法，0 不合法
 int taos_sink_valid_identifier(const char *name);
 
-// 启动 sink 后台线程（broker 初始化时调用一次）
-// 内部会建库建表 + 启动消费者线程
+// 启动/复用 sink 后台线程，并确保目标表已初始化
 // 返回 0 成功，非 0 失败
 int taos_sink_start(const taos_sink_config *cfg);
 
@@ -43,10 +42,17 @@ int taos_sink_start(const taos_sink_config *cfg);
 // 返回 0 成功，非 0 失败
 int taos_sink_enqueue(const taos_rule_result *result);
 
+// 按配置入队一条数据；同库不同表时由 cfg->stable 决定写入目标表
+int taos_sink_enqueue_with_config(
+    const taos_sink_config *cfg, const taos_rule_result *result);
+
 // 返回 1 已启动，0 未启动
 int taos_sink_is_started(void);
 
-// 停止 sink 后台线程并 flush 剩余数据（broker 关闭时调用）
+// 停止所有 sink 并 flush 剩余数据（broker 关闭时调用）
+void taos_sink_stop_all(void);
+
+// 兼容旧调用
 void taos_sink_stop(void);
 
 #ifdef __cplusplus

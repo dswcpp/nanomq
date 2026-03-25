@@ -1594,20 +1594,13 @@ rule_engine_insert_sql(nano_work *work)
 				pub_packet_struct *pp = work->pub_packet;
 				conn_param *cp = work->cparam;
 
-				if (!taos_sink_is_started()) {
-					taos_sink_config cfg;
-					cfg.host     = t->host;
-					cfg.port     = t->port > 0 ? t->port : 6041;
-					cfg.username = t->username;
-					cfg.password = t->password;
-					cfg.db       = t->db;
-					cfg.stable   = t->table;
-
-					if (taos_sink_start(&cfg) != 0) {
-						log_error("taos_sink_start failed");
-						continue;
-					}
-				}
+				taos_sink_config cfg;
+				cfg.host     = t->host;
+				cfg.port     = t->port > 0 ? t->port : 6041;
+				cfg.username = t->username;
+				cfg.password = t->password;
+				cfg.db       = t->db;
+				cfg.stable   = t->table;
 
 				const char *cid = (const char *) conn_param_get_clientid(cp);
 				const char *usr = (const char *) conn_param_get_username(cp);
@@ -1623,8 +1616,8 @@ rule_engine_insert_sql(nano_work *work)
 				rr.timestamp_ms = (int64_t) time(NULL) * 1000LL;
 
 				// 非阻塞入队，内部深拷贝
-				if (taos_sink_enqueue(&rr) != 0) {
-					log_error("taos_sink_enqueue failed");
+				if (taos_sink_enqueue_with_config(&cfg, &rr) != 0) {
+					log_error("taos_sink_enqueue_with_config failed");
 				}
 			}
 #endif

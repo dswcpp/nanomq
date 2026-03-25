@@ -1398,7 +1398,7 @@ broker(conf *nanomq_conf)
 #endif
 
 #if defined(SUPP_TAOS)
-	taos_sink_stop();
+	taos_sink_stop_all();
 #endif
 
 	return 0;
