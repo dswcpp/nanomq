@@ -20,6 +20,8 @@
 
 #if defined(SUPP_TAOS)
 #include "taos_sink.hpp"
+#include "weld_telemetry.h"
+#include "weld_telemetry_async.h"
 #endif
 
 
@@ -1231,7 +1233,7 @@ rule_engine_insert_sql(nano_work *work)
 
 	nng_mtx *rule_mutex = work->config->rule_eng.rule_mutex;
 
-	log_info("rule_engine: rule_size=%zu, option=0x%x, RULE_ENG_TAOS=0x%x",
+	log_debug("rule_engine: rule_size=%zu, option=0x%x, RULE_ENG_TAOS=0x%x",
 		rule_size, work->config->rule_eng.option, RULE_ENG_TAOS);
 
 	for (size_t i = 0; i < rule_size; i++) {
@@ -1589,10 +1591,24 @@ rule_engine_insert_sql(nano_work *work)
 #if defined(SUPP_TAOS)
 			if (RULE_ENG_TAOS & work->config->rule_eng.option &&
 			    RULE_FORWORD_TAOS == rules[i].forword_type) {
-				log_info("taos_sink: rule matched!");
+				log_debug("taos_sink: rule matched!");
 				rule_taos *t = rules[i].taos;
 				pub_packet_struct *pp = work->pub_packet;
 				conn_param *cp = work->cparam;
+
+				if (t != NULL &&
+				    t->parser == RULE_TAOS_PARSER_WELD_TELEMETRY) {
+					if (weld_telemetry_async_enqueue(t,
+						    pp->var_header.publish.topic_name.body,
+						    pp->fixed_header.qos,
+						    pp->var_header.publish.packet_id,
+						    pp->payload.data,
+						    pp->payload.len) != 0) {
+						log_error(
+						    "weld_telemetry_async_enqueue failed");
+					}
+					continue;
+				}
 
 				taos_sink_config cfg;
 				cfg.host     = t->host;

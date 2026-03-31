@@ -416,7 +416,9 @@ message("Install prefix: " ${CMAKE_INSTALL_PREFIX})
 # 	ARCHIVE DESTINATION lib)# static library
 # install(FILES nng.h DESTINATION include)
 
-FILE(GLOB CONFIG_FILES "${PROJECT_SOURCE_DIR}/etc/*.conf")
+FILE(GLOB CONFIG_FILES
+  "${PROJECT_SOURCE_DIR}/etc/*.conf"
+  "${PROJECT_SOURCE_DIR}/etc/*.sql")
 
 if (NOT WIN32 AND NOT CYGWIN)
   install(FILES ${CONFIG_FILES} DESTINATION ${CMAKE_INSTALL_PREFIX}/etc)

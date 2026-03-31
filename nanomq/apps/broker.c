@@ -60,7 +60,8 @@
 #endif
 
 #if defined(SUPP_TAOS)
-	#include "taos_sink.hpp"
+#include "weld_taos_sink.hpp"
+#include "taos_sink.hpp"
 #endif
 // #if defined(SUPP_RULE_ENGINE)
 // 	#include <foundationdb/fdb_c.h>
@@ -535,10 +536,13 @@ server_cb(void *arg)
 	case WAIT:
 		// do not access to cparam
 		log_debug("WAIT ^^^^ ctx%d ^^^^", work->ctx.id);
+		log_debug("WAIT msg types: flag=%d cmd=%d hdr=%d",
+		    work->flag, nng_msg_cmd_type(work->msg),
+		    nng_msg_get_type(work->msg));
 #if defined(SUPP_PLUGIN)
 		work->user_property = NULL;
 #endif
-		if (nng_msg_get_type(work->msg) == CMD_PUBLISH) {
+		if (work->flag == CMD_PUBLISH || work->flag == CMD_PUBLISH_V5) {
 			if ((rv = nng_aio_result(work->aio)) != 0) {
 				log_error("WAIT nng aio result error: %d", rv);
 				NANO_NNG_FATAL("WAIT nng_ctx_recv/send", rv);	// shall nerver reach here
@@ -586,12 +590,21 @@ server_cb(void *arg)
 #if defined(SUPP_RULE_ENGINE)
 			rule_opt = work->config->rule_eng.option;
 #endif
+			size_t rule_count = 0;
+#if defined(SUPP_RULE_ENGINE)
+			rule_count = cvector_size(work->config->rule_eng.rules);
+#endif
 			uint8_t iceoryx_opt = 0;
 #if defined(SUPP_ICEORYX)
 			iceoryx_opt = 1;
 #endif
+			log_debug(
+			    "broker recv decision: hook=%d exchange=%zu rule_opt=0x%x rule_count=%zu iceoryx=%u",
+			    hook_conf->enable ? 1 : 0, exge_conf->count, rule_opt,
+			    rule_count, (unsigned) iceoryx_opt);
 			if (hook_conf->enable || exge_conf->count > 0 ||
-			        rule_opt != RULE_ENG_OFF || iceoryx_opt == 1) {
+			        rule_opt != RULE_ENG_OFF || rule_count > 0 ||
+			        iceoryx_opt == 1) {
 				work->state = SEND;
 				nng_aio_finish(work->aio, 0);
 				break;
@@ -632,18 +645,22 @@ server_cb(void *arg)
 		}
 		break;
 	case SEND:
-		log_warn("SEND state entered, ctx%d", work->ctx.id);
 		log_debug("SEND ^^^^ ctx%d ^^^^", work->ctx.id);
 #if defined(SUPP_RULE_ENGINE)
-		log_warn("broker: flag=%d, option=0x%x, RULE_ENG_OFF=%d",
+		log_debug("broker: flag=%d, option=0x%x, RULE_ENG_OFF=%d",
 			work->flag, work->config->rule_eng.option, RULE_ENG_OFF);
-		if (work->flag == CMD_PUBLISH && work->config->rule_eng.option != RULE_ENG_OFF) {
-			log_warn("broker: calling rule_engine_insert_sql");
+		if ((work->flag == CMD_PUBLISH ||
+		        work->flag == CMD_PUBLISH_V5) &&
+		    (work->config->rule_eng.option != RULE_ENG_OFF ||
+		        cvector_size(work->config->rule_eng.rules) > 0)) {
+			log_debug("broker: calling rule_engine_insert_sql");
 			rule_engine_insert_sql(work);
 		}
 #endif
 #if defined(SUPP_ICEORYX)
-		if (work->flag == CMD_PUBLISH && work->msg != NULL &&
+		if ((work->flag == CMD_PUBLISH ||
+		        work->flag == CMD_PUBLISH_V5) &&
+		        work->msg != NULL &&
 		        true == nano_iceoryx_topic_filter("ice/fwd",
 		        work->pub_packet->var_header.publish.topic_name.body,
 		        work->pub_packet->var_header.publish.topic_name.len)) {
@@ -690,7 +707,7 @@ server_cb(void *arg)
 	case END:
 		log_debug("END ^^^^ ctx%d ^^^^ ", work->ctx.id);
 		// send disconnect event msg first
-		if (nng_msg_get_type(work->msg) == CMD_PUBLISH) {
+		if (work->flag == CMD_PUBLISH || work->flag == CMD_PUBLISH_V5) {
 			if ((rv = nng_aio_result(work->aio)) != 0) {
 				log_error("WAIT nng aio result error: %d", rv);
 			}
@@ -1254,11 +1271,17 @@ broker(conf *nanomq_conf)
 	}
 
 	if (nanomq_conf->http_server.enable) {
+		const char *http_addr = nanomq_conf->http_server.ip_addr != NULL
+		    ? nanomq_conf->http_server.ip_addr
+		    : HTTP_DEFAULT_ADDR;
+		uint16_t http_port = nanomq_conf->http_server.port != 0
+		    ? nanomq_conf->http_server.port
+		    : HTTP_DEFAULT_PORT;
 		nanomq_conf->http_server.broker_sock = &sock;
 		if (start_rest_server(nanomq_conf) == 0) {
-			log_warn("NanoMQ (ver %d.%d.%d) Serving HTTP Server on http://%s:%d",
-					NANO_VER_MAJOR, NANO_VER_MINOR, NANO_VER_PATCH,
-					nanomq_conf->http_server.ip_addr, nanomq_conf->http_server.port);
+			log_info("NanoMQ (ver %d.%d.%d) Serving HTTP Server on http://%s:%d",
+						NANO_VER_MAJOR, NANO_VER_MINOR, NANO_VER_PATCH,
+						http_addr, http_port);
 		} else {
 			log_error("Start rest server failed!");
 		}
@@ -1398,6 +1421,7 @@ broker(conf *nanomq_conf)
 #endif
 
 #if defined(SUPP_TAOS)
+	weld_taos_sink_stop_all();
 	taos_sink_stop_all();
 #endif
 

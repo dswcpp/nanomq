@@ -45,3 +45,22 @@ NanoNNG/
 
 # Generate files
 fdb_version.h
+
+# Windows DLL leftovers (cross-compiled artifacts in project root)
+libatomic-1.dll
+libwinpthread-1.dll
+
+# Runtime/test artifacts
+tmp/
+build-runtime/
+test_taos.sh
+test_taos_sink.sh
+
+# External dependencies (submodule worktrees / local clones)
+extern/l8w8jwt/
+
+# Editor / OS
+*.swp
+*.swo
+*~
+Thumbs.db

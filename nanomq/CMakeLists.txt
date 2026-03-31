@@ -112,7 +112,12 @@ endif(ENABLE_TIMESCALEDB)
 
 if(ENABLE_TAOS)
   target_sources(nanomq PRIVATE taos_sink.cpp)
+  target_sources(nanomq PRIVATE weld_taos_sink.cpp)
+  target_sources(nanomq PRIVATE weld_telemetry.c)
+  target_sources(nanomq PRIVATE weld_telemetry_async.cpp)
   set_source_files_properties(taos_sink.cpp PROPERTIES LANGUAGE CXX)
+  set_source_files_properties(weld_taos_sink.cpp PROPERTIES LANGUAGE CXX)
+  set_source_files_properties(weld_telemetry_async.cpp PROPERTIES LANGUAGE CXX)
 endif(ENABLE_TAOS)
 
 if(ENABLE_AWS_BRIDGE)
@@ -153,6 +158,8 @@ if(BUILD_STATIC)
 else()
   target_link_libraries(nanomq nng)
 endif()
+
+target_link_libraries(nanomq sqlite3)
 
 target_compile_definitions(nanomq PRIVATE -DPARALLEL=${PARALLEL})
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
