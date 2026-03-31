@@ -223,6 +223,42 @@ test_duplicate_ts_ms_rejects_whole_message(void)
 }
 
 static void
+test_duplicate_ts_us_rejects_whole_message(void)
+{
+    const char *topic =
+        "weld/v1/sz01/line_01/station_03/gw3568_01/telemetry/power/chv01";
+    const char *payload =
+        "{"
+        "\"msg_class\":\"telemetry\","
+        "\"gateway_id\":\"gw3568_01\","
+        "\"device_id\":\"chv01\","
+        "\"msg_id\":\"msg-dup-us\","
+        "\"spec_ver\":\"1.0\","
+        "\"ts_ms\":1710000000000,"
+        "\"seq\":14,"
+        "\"device_type\":\"voltage_transducer\","
+        "\"device_model\":\"CHV-2KE\","
+        "\"signal_type\":\"voltage\","
+        "\"quality\":{\"code\":0},"
+        "\"data\":{"
+        "\"point_count\":2,"
+        "\"fields\":[{\"name\":\"voltage\",\"unit\":\"V\"}],"
+        "\"points\":["
+        "{\"ts_us\":3000001,\"values\":[24.1]},"
+        "{\"ts_us\":3000001,\"values\":[24.2]}"
+        "]"
+        "}"
+        "}";
+
+    rule_taos rule = make_rule("weld_voltage_point");
+    pub_packet_struct packet = make_packet(topic, payload);
+
+    reset_rows();
+    assert(weld_telemetry_handle_publish(&rule, &packet) != 0);
+    assert(g_enqueue_count == 0);
+}
+
+static void
 test_enqueue_failure_rejects_whole_message(void)
 {
     const char *topic =
@@ -301,6 +337,7 @@ main()
 {
     test_current_message_expands_points();
     test_duplicate_ts_ms_rejects_whole_message();
+    test_duplicate_ts_us_rejects_whole_message();
     test_enqueue_failure_rejects_whole_message();
     test_capacity_precheck_rejects_before_enqueue();
     return 0;

@@ -30,12 +30,131 @@ typedef struct {
 	int voltage_idx;
 } weld_field_indices;
 
+typedef struct {
+	uint64_t accept_msg_count;
+	uint64_t accept_point_count;
+	uint64_t fail_msg_count;
+	uint64_t duplicate_ts_reject_count;
+	uint64_t sink_overload_reject_count;
+	uint64_t high_freq_ts_ms_warn_count;
+	uint64_t sink_enqueue_fail_count;
+	uint64_t last_log_accept_msg_count;
+	uint64_t last_log_accept_point_count;
+	uint64_t last_log_fail_msg_count;
+	uint64_t last_log_duplicate_ts_reject_count;
+	uint64_t last_log_sink_overload_reject_count;
+	uint64_t last_log_high_freq_ts_ms_warn_count;
+	uint64_t last_log_sink_enqueue_fail_count;
+	int64_t  last_log_ts_us;
+	int64_t  next_log_ts_us;
+} weld_telemetry_stats;
+
+static weld_telemetry_stats g_weld_telemetry_stats = { 0 };
+
 static int64_t
 weld_now_epoch_us(void)
 {
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return (int64_t) tv.tv_sec * 1000000LL + (int64_t) tv.tv_usec;
+}
+
+static void
+weld_stats_inc(uint64_t *value)
+{
+	__sync_fetch_and_add(value, 1);
+}
+
+static uint64_t
+weld_stats_read(uint64_t *value)
+{
+	return (uint64_t) __sync_add_and_fetch(value, 0);
+}
+
+static void
+weld_log_stats_if_due(int64_t now_us)
+{
+	int64_t expected = g_weld_telemetry_stats.next_log_ts_us;
+	if (expected == 0) {
+		int64_t next = now_us + 30000000LL;
+		if (!__sync_bool_compare_and_swap(
+		        &g_weld_telemetry_stats.next_log_ts_us, 0, next)) {
+			return;
+		}
+		g_weld_telemetry_stats.last_log_ts_us = now_us;
+		return;
+	}
+	if (now_us < expected) {
+		return;
+	}
+	if (!__sync_bool_compare_and_swap(&g_weld_telemetry_stats.next_log_ts_us,
+	        expected, now_us + 30000000LL)) {
+		return;
+	}
+
+	{
+		uint64_t accept_msg = weld_stats_read(
+		    &g_weld_telemetry_stats.accept_msg_count);
+		uint64_t accept_point = weld_stats_read(
+		    &g_weld_telemetry_stats.accept_point_count);
+		uint64_t fail_msg = weld_stats_read(
+		    &g_weld_telemetry_stats.fail_msg_count);
+		uint64_t duplicate_ts_reject = weld_stats_read(
+		    &g_weld_telemetry_stats.duplicate_ts_reject_count);
+		uint64_t sink_overload_reject = weld_stats_read(
+		    &g_weld_telemetry_stats.sink_overload_reject_count);
+		uint64_t high_freq_ts_ms_warn = weld_stats_read(
+		    &g_weld_telemetry_stats.high_freq_ts_ms_warn_count);
+		uint64_t sink_enqueue_fail = weld_stats_read(
+		    &g_weld_telemetry_stats.sink_enqueue_fail_count);
+		double elapsed_sec =
+		    g_weld_telemetry_stats.last_log_ts_us > 0 &&
+		            now_us > g_weld_telemetry_stats.last_log_ts_us ?
+		        (double) (now_us - g_weld_telemetry_stats.last_log_ts_us) /
+		            1000000.0 :
+		        0.0;
+
+		log_info("weld_telemetry: accept_msg=%llu accept_point=%llu "
+		         "fail_msg=%llu duplicate_ts_reject=%llu "
+		         "sink_overload_reject=%llu high_freq_ts_ms_warn=%llu "
+		         "sink_enqueue_fail=%llu window_s=%.2f accept_msg_rate=%.2f "
+		         "accept_point_rate=%.2f fail_msg_rate=%.2f",
+		    (unsigned long long) accept_msg,
+		    (unsigned long long) accept_point,
+		    (unsigned long long) fail_msg,
+		    (unsigned long long) duplicate_ts_reject,
+		    (unsigned long long) sink_overload_reject,
+		    (unsigned long long) high_freq_ts_ms_warn,
+		    (unsigned long long) sink_enqueue_fail,
+		    elapsed_sec,
+		    elapsed_sec > 0.0 ?
+		        (accept_msg -
+		            g_weld_telemetry_stats.last_log_accept_msg_count) /
+		                elapsed_sec :
+		        0.0,
+		    elapsed_sec > 0.0 ?
+		        (accept_point -
+		            g_weld_telemetry_stats.last_log_accept_point_count) /
+		                elapsed_sec :
+		        0.0,
+		    elapsed_sec > 0.0 ?
+		        (fail_msg - g_weld_telemetry_stats.last_log_fail_msg_count) /
+		                elapsed_sec :
+		        0.0);
+
+		g_weld_telemetry_stats.last_log_accept_msg_count = accept_msg;
+		g_weld_telemetry_stats.last_log_accept_point_count = accept_point;
+		g_weld_telemetry_stats.last_log_fail_msg_count = fail_msg;
+		g_weld_telemetry_stats.last_log_duplicate_ts_reject_count =
+		    duplicate_ts_reject;
+		g_weld_telemetry_stats.last_log_sink_overload_reject_count =
+		    sink_overload_reject;
+		g_weld_telemetry_stats.last_log_high_freq_ts_ms_warn_count =
+		    high_freq_ts_ms_warn;
+		g_weld_telemetry_stats.last_log_sink_enqueue_fail_count =
+		    sink_enqueue_fail;
+		g_weld_telemetry_stats.last_log_ts_us = now_us;
+	}
 }
 
 static const char *
@@ -446,6 +565,7 @@ weld_telemetry_handle_publish(
 	int64_t         recv_ts_us = 0;
 	int             use_ts_us = 0;
 	int             point_count = 0;
+	int64_t         stats_now_us = weld_now_epoch_us();
 	int64_t        *ts_seen = NULL;
 	weld_taos_row  *rows = NULL;
 	weld_field_indices field_indices;
@@ -551,6 +671,18 @@ weld_telemetry_handle_publish(
 		goto done;
 	}
 
+	if (!use_ts_us &&
+	    (strcmp(cJSON_GetStringValue(signal_type), "current") == 0 ||
+	        strcmp(cJSON_GetStringValue(signal_type), "voltage") == 0) &&
+	    point_count > 1) {
+		log_warn("weld_telemetry: high-frequency power message uses ts_ms; "
+		         "unique ts_us is recommended to avoid timestamp collisions "
+		         "(signal_type=%s, points=%d, topic=%s)",
+		    cJSON_GetStringValue(signal_type), point_count,
+		    pub_packet->var_header.publish.topic_name.body);
+		weld_stats_inc(&g_weld_telemetry_stats.high_freq_ts_ms_warn_count);
+	}
+
 	{
 		int accept_rc =
 		    weld_taos_sink_can_accept_rows_with_config(&sink_cfg, (size_t) point_count);
@@ -563,6 +695,7 @@ weld_telemetry_handle_publish(
 			         "(signal_type=%s, points=%d, topic=%s)",
 			    cJSON_GetStringValue(signal_type), point_count,
 			    pub_packet->var_header.publish.topic_name.body);
+			weld_stats_inc(&g_weld_telemetry_stats.sink_overload_reject_count);
 			goto done;
 		}
 	}
@@ -691,25 +824,35 @@ weld_telemetry_handle_publish(
 		}
 	}
 
-	if (!use_ts_us) {
-		qsort(ts_seen, (size_t) point_count, sizeof(int64_t), weld_compare_int64);
-		for (int i = 1; i < point_count; ++i) {
-			if (ts_seen[i - 1] == ts_seen[i]) {
-				log_error("weld_telemetry: duplicate ts_ms within message");
-				goto done;
-			}
+	qsort(ts_seen, (size_t) point_count, sizeof(int64_t), weld_compare_int64);
+	for (int i = 1; i < point_count; ++i) {
+		if (ts_seen[i - 1] == ts_seen[i]) {
+			log_error("weld_telemetry: duplicate point timestamp within message "
+			         "(signal_type=%s, points=%d, topic=%s)",
+			    cJSON_GetStringValue(signal_type), point_count,
+			    pub_packet->var_header.publish.topic_name.body);
+			weld_stats_inc(&g_weld_telemetry_stats.duplicate_ts_reject_count);
+			goto done;
 		}
 	}
 
 	if (weld_taos_sink_enqueue_rows_with_config(
 	        &sink_cfg, rows, (size_t) point_count) != 0) {
 		log_error("weld_telemetry: failed to enqueue structured rows");
+		weld_stats_inc(&g_weld_telemetry_stats.sink_enqueue_fail_count);
 		goto done;
 	}
 
 	rc = 0;
+	weld_stats_inc(&g_weld_telemetry_stats.accept_msg_count);
+	__sync_fetch_and_add(
+	    &g_weld_telemetry_stats.accept_point_count, (uint64_t) point_count);
 
 done:
+	if (rc != 0) {
+		weld_stats_inc(&g_weld_telemetry_stats.fail_msg_count);
+	}
+	weld_log_stats_if_due(stats_now_us);
 	if (ts_seen != NULL) {
 		nng_free(ts_seen, (size_t) point_count * sizeof(int64_t));
 	}

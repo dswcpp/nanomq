@@ -1,6 +1,7 @@
 #include "weld_taos_sink.hpp"
 
 #include <ctype.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -22,10 +23,10 @@
 
 namespace {
 
-constexpr size_t WELD_BATCH_SIZE = 1000;
-constexpr int    WELD_FLUSH_MS   = 100;
-constexpr size_t WELD_QUEUE_MAX  = 40000;
-constexpr size_t WELD_WORKER_MAX = 8;
+constexpr size_t WELD_BATCH_SIZE_DEFAULT = 1000;
+constexpr int    WELD_FLUSH_MS_DEFAULT   = 100;
+constexpr size_t WELD_QUEUE_MAX_DEFAULT  = 40000;
+constexpr size_t WELD_WORKER_MAX_DEFAULT = 8;
 constexpr int    WELD_RETRY_LIMIT = 2;
 constexpr int    WELD_STOP_FLUSH_RETRY_LIMIT = 1;
 constexpr int    WELD_RETRY_BASE_MS = 50;
@@ -43,6 +44,15 @@ enum class StableKind {
     Voltage,
     Unknown,
 };
+
+enum class TdExecStatus {
+    Ok,
+    RetryableError,
+    NonRetryableError,
+};
+
+using TdExecFn = TdExecStatus (*)(
+    const std::string &, const std::string &, const std::string &, std::string *);
 
 struct WeldQueuedRow {
     std::string stable;
@@ -113,11 +123,30 @@ struct WeldQueuedRow {
     std::string channel_id;
 };
 
+struct WeldStatsSnapshot {
+    size_t   queue_depth = 0;
+    uint64_t enqueue_msg_count = 0;
+    uint64_t enqueue_row_count = 0;
+    uint64_t drop_msg_count = 0;
+    uint64_t drop_row_count = 0;
+    uint64_t batch_ok_count = 0;
+    uint64_t batch_fail_count = 0;
+    uint64_t batch_split_count = 0;
+    uint64_t non_retryable_fail_count = 0;
+    uint64_t row_ok_count = 0;
+    uint64_t row_fail_count = 0;
+};
+
 struct WeldState {
     std::string              url;
     std::string              auth_header;
     std::string              db;
     std::set<std::string>    stables;
+    bool                     db_precision_verified = false;
+    size_t                   batch_size = WELD_BATCH_SIZE_DEFAULT;
+    int                      flush_ms = WELD_FLUSH_MS_DEFAULT;
+    size_t                   queue_max = WELD_QUEUE_MAX_DEFAULT;
+    size_t                   worker_max = WELD_WORKER_MAX_DEFAULT;
     std::deque<WeldQueuedRow> queue;
     bool                     running = false;
     bool                     started = false;
@@ -130,12 +159,82 @@ struct WeldState {
     std::atomic<uint64_t>    drop_row_count { 0 };
     std::atomic<uint64_t>    batch_ok_count { 0 };
     std::atomic<uint64_t>    batch_fail_count { 0 };
+    std::atomic<uint64_t>    batch_split_count { 0 };
+    std::atomic<uint64_t>    non_retryable_fail_count { 0 };
     std::atomic<uint64_t>    row_ok_count { 0 };
     std::atomic<uint64_t>    row_fail_count { 0 };
+    WeldStatsSnapshot        stats_last_snapshot;
+    std::chrono::steady_clock::time_point stats_last_log_tp;
+    bool                     stats_window_ready = false;
 };
 
 WeldState g_state;
 std::mutex g_start_mutex;
+
+static size_t
+read_env_size_with_min(
+    const char *name, size_t default_value, size_t min_value)
+{
+    const char *raw = getenv(name);
+    if (raw == NULL || raw[0] == '\0') {
+        return default_value;
+    }
+
+    char *end = NULL;
+    unsigned long long value = strtoull(raw, &end, 10);
+    if (end == raw || (end != NULL && *end != '\0')) {
+        log_warn("weld_taos_sink: ignore invalid env %s=%s", name, raw);
+        return default_value;
+    }
+
+    if (value < min_value) {
+        log_warn("weld_taos_sink: env %s=%s below minimum %zu, clamp to %zu",
+            name, raw, min_value, min_value);
+        return min_value;
+    }
+
+    return (size_t) value;
+}
+
+static int
+read_env_int_with_min(const char *name, int default_value, int min_value)
+{
+    const char *raw = getenv(name);
+    if (raw == NULL || raw[0] == '\0') {
+        return default_value;
+    }
+
+    char *end = NULL;
+    long value = strtol(raw, &end, 10);
+    if (end == raw || (end != NULL && *end != '\0')) {
+        log_warn("weld_taos_sink: ignore invalid env %s=%s", name, raw);
+        return default_value;
+    }
+
+    if (value < min_value) {
+        log_warn("weld_taos_sink: env %s=%s below minimum %d, clamp to %d",
+            name, raw, min_value, min_value);
+        return min_value;
+    }
+
+    return (int) value;
+}
+
+static void
+load_runtime_config_once(void)
+{
+    static std::once_flag loaded_once;
+    std::call_once(loaded_once, [] {
+        g_state.batch_size = read_env_size_with_min(
+            "NANOMQ_WELD_BATCH_SIZE", WELD_BATCH_SIZE_DEFAULT, 1);
+        g_state.flush_ms = read_env_int_with_min(
+            "NANOMQ_WELD_FLUSH_MS", WELD_FLUSH_MS_DEFAULT, 1);
+        g_state.queue_max = read_env_size_with_min(
+            "NANOMQ_WELD_QUEUE_MAX", WELD_QUEUE_MAX_DEFAULT, 1);
+        g_state.worker_max = read_env_size_with_min(
+            "NANOMQ_WELD_WORKER_MAX", WELD_WORKER_MAX_DEFAULT, 1);
+    });
+}
 
 static StableKind
 get_stable_kind(const std::string &stable)
@@ -197,92 +296,303 @@ build_auth_header(const taos_sink_config *cfg)
     return "Basic " + base64_encode(creds);
 }
 
-static int
-tdengine_exec(const std::string &url_str, const std::string &auth_hdr,
-    const std::string &sql)
+static bool
+response_contains_precision_us(const std::string &response)
 {
-    nng_url         *url    = NULL;
-    nng_http_client *client = NULL;
-    nng_http_req    *req    = NULL;
-    nng_http_res    *res    = NULL;
-    nng_aio         *aio    = NULL;
-    int              rc     = -1;
+    bool has_precision = false;
+    bool has_us = false;
+    for (size_t i = 0; i < response.size(); ++i) {
+        if (i + 9 <= response.size()) {
+            std::string token = response.substr(i, 9);
+            for (char &ch : token) {
+                ch = (char) tolower((unsigned char) ch);
+            }
+            if (token == "precision") {
+                has_precision = true;
+            }
+        }
+        if (i + 4 <= response.size()) {
+            std::string token = response.substr(i, 4);
+            for (char &ch : token) {
+                ch = (char) tolower((unsigned char) ch);
+            }
+            if (token == "'us'") {
+                has_us = true;
+            }
+        }
+    }
+    return has_precision && has_us;
+}
 
-    int rv;
-    if ((rv = nng_url_parse(&url, url_str.c_str())) != 0) {
-        log_error("weld_taos_sink: url parse failed: %s", nng_strerror(rv));
+static int
+extract_tdengine_code(const std::string &response)
+{
+    const std::string marker = "\"code\":";
+    const size_t      pos    = response.find(marker);
+    if (pos == std::string::npos) {
         return -1;
     }
-    if ((rv = nng_http_client_alloc(&client, url)) != 0) {
-        log_error("weld_taos_sink: client alloc failed: %s", nng_strerror(rv));
-        goto out;
-    }
-    if ((rv = nng_http_req_alloc(&req, url)) != 0) {
-        log_error("weld_taos_sink: req alloc failed: %s", nng_strerror(rv));
-        goto out;
-    }
-    if ((rv = nng_http_res_alloc(&res)) != 0) {
-        log_error("weld_taos_sink: res alloc failed: %s", nng_strerror(rv));
-        goto out;
-    }
-    if ((rv = nng_aio_alloc(&aio, NULL, NULL)) != 0) {
-        log_error("weld_taos_sink: aio alloc failed: %s", nng_strerror(rv));
-        goto out;
+
+    size_t begin = pos + marker.size();
+    while (begin < response.size() &&
+           isspace((unsigned char) response[begin])) {
+        ++begin;
     }
 
-    nng_http_req_set_method(req, "POST");
-    nng_http_req_set_header(req, "Authorization", auth_hdr.c_str());
-    nng_http_req_set_header(req, "Content-Type", "text/plain");
-    nng_http_req_copy_data(req, sql.c_str(), sql.size());
+    bool negative = false;
+    if (begin < response.size() && response[begin] == '-') {
+        negative = true;
+        ++begin;
+    }
 
-    nng_aio_set_timeout(aio, 5000);
-    nng_http_client_transact(client, req, res, aio);
-    nng_aio_wait(aio);
+    int value = 0;
+    bool found_digit = false;
+    while (begin < response.size() &&
+           isdigit((unsigned char) response[begin])) {
+        found_digit = true;
+        value = value * 10 + (response[begin] - '0');
+        ++begin;
+    }
+    if (!found_digit) {
+        return -1;
+    }
+    return negative ? -value : value;
+}
 
-    if ((rv = nng_aio_result(aio)) != 0) {
+static bool
+is_non_retryable_tdengine_error(const std::string &response)
+{
+    const int code = extract_tdengine_code(response);
+    if (code == 1547) {
+        return true;
+    }
+
+    std::string lowered = response;
+    for (char &ch : lowered) {
+        ch = (char) tolower((unsigned char) ch);
+    }
+
+    return lowered.find("timestamp data out of range") != std::string::npos ||
+           lowered.find("syntax error") != std::string::npos ||
+           lowered.find("invalid table name") != std::string::npos ||
+           lowered.find("table does not exist") != std::string::npos ||
+           lowered.find("database not exist") != std::string::npos ||
+           lowered.find("authentication") != std::string::npos ||
+           lowered.find("invalid password") != std::string::npos;
+}
+
+struct TdHttpReuseContext {
+    std::string      url_str;
+    nng_url         *url = NULL;
+    nng_http_client *client = NULL;
+    nng_http_req    *req = NULL;
+    nng_http_res    *res = NULL;
+    nng_aio         *aio = NULL;
+    nng_http_conn   *conn = NULL;
+
+    ~TdHttpReuseContext()
+    {
+        reset();
+    }
+
+    void
+    close_conn()
+    {
+        if (conn != NULL) {
+            nng_http_conn_close(conn);
+            conn = NULL;
+        }
+    }
+
+    void
+    reset()
+    {
+        close_conn();
+        if (aio != NULL) {
+            nng_aio_free(aio);
+            aio = NULL;
+        }
+        if (res != NULL) {
+            nng_http_res_free(res);
+            res = NULL;
+        }
+        if (req != NULL) {
+            nng_http_req_free(req);
+            req = NULL;
+        }
+        if (client != NULL) {
+            nng_http_client_free(client);
+            client = NULL;
+        }
+        if (url != NULL) {
+            nng_url_free(url);
+            url = NULL;
+        }
+        url_str.clear();
+    }
+
+    TdExecStatus
+    ensure_transport(const std::string &target_url)
+    {
+        if (url_str == target_url && url != NULL && client != NULL &&
+            req != NULL && res != NULL && aio != NULL) {
+            return TdExecStatus::Ok;
+        }
+
+        reset();
+
+        int rv;
+        if ((rv = nng_url_parse(&url, target_url.c_str())) != 0) {
+            log_error("weld_taos_sink: url parse failed: %s", nng_strerror(rv));
+            return TdExecStatus::NonRetryableError;
+        }
+        if ((rv = nng_http_client_alloc(&client, url)) != 0) {
+            log_error("weld_taos_sink: client alloc failed: %s",
+                nng_strerror(rv));
+            reset();
+            return TdExecStatus::RetryableError;
+        }
+        if ((rv = nng_http_req_alloc(&req, url)) != 0) {
+            log_error("weld_taos_sink: req alloc failed: %s", nng_strerror(rv));
+            reset();
+            return TdExecStatus::RetryableError;
+        }
+        if ((rv = nng_http_res_alloc(&res)) != 0) {
+            log_error("weld_taos_sink: res alloc failed: %s", nng_strerror(rv));
+            reset();
+            return TdExecStatus::RetryableError;
+        }
+        if ((rv = nng_aio_alloc(&aio, NULL, NULL)) != 0) {
+            log_error("weld_taos_sink: aio alloc failed: %s", nng_strerror(rv));
+            reset();
+            return TdExecStatus::RetryableError;
+        }
+
+        url_str = target_url;
+        return TdExecStatus::Ok;
+    }
+
+    TdExecStatus
+    ensure_conn()
+    {
+        if (conn != NULL) {
+            return TdExecStatus::Ok;
+        }
+
+        nng_aio_set_timeout(aio, 5000);
+        nng_http_client_connect(client, aio);
+        nng_aio_wait(aio);
+
+        const int rv = nng_aio_result(aio);
+        if (rv != 0) {
+            log_error(
+                "weld_taos_sink: http connect failed: %s", nng_strerror(rv));
+            close_conn();
+            return TdExecStatus::RetryableError;
+        }
+
+        conn = (nng_http_conn *) nng_aio_get_output(aio, 0);
+        if (conn == NULL) {
+            log_error("weld_taos_sink: http connect returned null conn");
+            return TdExecStatus::RetryableError;
+        }
+        return TdExecStatus::Ok;
+    }
+};
+
+static TdExecStatus
+tdengine_exec_http(const std::string &url_str, const std::string &auth_hdr,
+    const std::string &sql, std::string *response_out)
+{
+    thread_local TdHttpReuseContext context;
+    TdExecStatus                    rc = context.ensure_transport(url_str);
+
+    if (rc != TdExecStatus::Ok) {
+        return rc;
+    }
+    rc = context.ensure_conn();
+    if (rc != TdExecStatus::Ok) {
+        return rc;
+    }
+
+    nng_http_req_reset(context.req);
+    nng_http_res_reset(context.res);
+    if (nng_http_req_set_uri(
+            context.req,
+            (context.url->u_requri != NULL && context.url->u_requri[0] != '\0')
+                ? context.url->u_requri
+                : "/") != 0) {
+        log_error("weld_taos_sink: req set uri failed");
+        context.close_conn();
+        return TdExecStatus::RetryableError;
+    }
+    nng_http_req_set_method(context.req, "POST");
+    nng_http_req_set_header(context.req, "Authorization", auth_hdr.c_str());
+    nng_http_req_set_header(context.req, "Content-Type", "text/plain");
+    nng_http_req_copy_data(context.req, sql.c_str(), sql.size());
+
+    nng_aio_set_timeout(context.aio, 5000);
+    nng_http_conn_transact(
+        context.conn, context.req, context.res, context.aio);
+    nng_aio_wait(context.aio);
+
+    const int rv = nng_aio_result(context.aio);
+    if (rv != 0) {
         log_error(
             "weld_taos_sink: http transact failed: %s", nng_strerror(rv));
-        goto out;
+        context.close_conn();
+        return TdExecStatus::RetryableError;
     }
 
     {
-        uint16_t status = nng_http_res_get_status(res);
+        uint16_t status = nng_http_res_get_status(context.res);
         void    *body   = NULL;
         size_t   body_len = 0;
-        nng_http_res_get_data(res, &body, &body_len);
+        nng_http_res_get_data(context.res, &body, &body_len);
+        std::string response(
+            body != NULL ? (char *) body : "", body != NULL ? body_len : 0);
+
+        if (response_out != NULL) {
+            *response_out = response;
+        }
 
         if (status != NNG_HTTP_STATUS_OK) {
             log_error("weld_taos_sink: HTTP %d body: %.*s", status,
                 (int) body_len, body != NULL ? (char *) body : "(null)");
-            goto out;
+            rc = status >= 500 ? TdExecStatus::RetryableError :
+                                 TdExecStatus::NonRetryableError;
+            return rc;
         }
 
-        std::string response(
-            body != NULL ? (char *) body : "", body != NULL ? body_len : 0);
         if (response.find("\"code\":0") != std::string::npos) {
-            rc = 0;
+            rc = TdExecStatus::Ok;
         } else {
             log_error("weld_taos_sink: TDengine error: %s", response.c_str());
+            rc = is_non_retryable_tdengine_error(response) ?
+                     TdExecStatus::NonRetryableError :
+                     TdExecStatus::RetryableError;
         }
     }
-
-out:
-    if (aio != NULL) {
-        nng_aio_free(aio);
-    }
-    if (res != NULL) {
-        nng_http_res_free(res);
-    }
-    if (req != NULL) {
-        nng_http_req_free(req);
-    }
-    if (client != NULL) {
-        nng_http_client_free(client);
-    }
-    if (url != NULL) {
-        nng_url_free(url);
-    }
     return rc;
+}
+
+static TdExecFn g_tdengine_exec_fn = tdengine_exec_http;
+
+static TdExecStatus
+tdengine_exec_detailed(const std::string &url_str, const std::string &auth_hdr,
+    const std::string &sql, std::string *response_out)
+{
+    return g_tdengine_exec_fn(url_str, auth_hdr, sql, response_out);
+}
+
+static int
+tdengine_exec(const std::string &url_str, const std::string &auth_hdr,
+    const std::string &sql)
+{
+    return tdengine_exec_detailed(url_str, auth_hdr, sql, NULL) ==
+                   TdExecStatus::Ok ?
+               0 :
+               -1;
 }
 
 static std::string
@@ -546,18 +856,6 @@ build_batch_insert_sql(const std::string &db,
     return sql;
 }
 
-struct WeldStatsSnapshot {
-    size_t   queue_depth;
-    uint64_t enqueue_msg_count;
-    uint64_t enqueue_row_count;
-    uint64_t drop_msg_count;
-    uint64_t drop_row_count;
-    uint64_t batch_ok_count;
-    uint64_t batch_fail_count;
-    uint64_t row_ok_count;
-    uint64_t row_fail_count;
-};
-
 static WeldStatsSnapshot
 snapshot_stats(void)
 {
@@ -572,6 +870,8 @@ snapshot_stats(void)
     snapshot.drop_row_count = g_state.drop_row_count.load();
     snapshot.batch_ok_count = g_state.batch_ok_count.load();
     snapshot.batch_fail_count = g_state.batch_fail_count.load();
+    snapshot.batch_split_count = g_state.batch_split_count.load();
+    snapshot.non_retryable_fail_count = g_state.non_retryable_fail_count.load();
     snapshot.row_ok_count = g_state.row_ok_count.load();
     snapshot.row_fail_count = g_state.row_fail_count.load();
     return snapshot;
@@ -581,9 +881,51 @@ static void
 log_stats_snapshot(void)
 {
     const WeldStatsSnapshot snapshot = snapshot_stats();
+    double                  elapsed_sec = 0.0;
+    WeldStatsSnapshot       delta;
+    const auto              now = std::chrono::steady_clock::now();
+
+    if (g_state.stats_window_ready) {
+        elapsed_sec = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - g_state.stats_last_log_tp)
+                          .count() /
+                      1000.0;
+        delta.enqueue_msg_count =
+            snapshot.enqueue_msg_count -
+            g_state.stats_last_snapshot.enqueue_msg_count;
+        delta.enqueue_row_count =
+            snapshot.enqueue_row_count -
+            g_state.stats_last_snapshot.enqueue_row_count;
+        delta.drop_msg_count =
+            snapshot.drop_msg_count - g_state.stats_last_snapshot.drop_msg_count;
+        delta.drop_row_count =
+            snapshot.drop_row_count - g_state.stats_last_snapshot.drop_row_count;
+        delta.batch_ok_count =
+            snapshot.batch_ok_count - g_state.stats_last_snapshot.batch_ok_count;
+        delta.batch_fail_count =
+            snapshot.batch_fail_count -
+            g_state.stats_last_snapshot.batch_fail_count;
+        delta.batch_split_count =
+            snapshot.batch_split_count -
+            g_state.stats_last_snapshot.batch_split_count;
+        delta.non_retryable_fail_count =
+            snapshot.non_retryable_fail_count -
+            g_state.stats_last_snapshot.non_retryable_fail_count;
+        delta.row_ok_count =
+            snapshot.row_ok_count - g_state.stats_last_snapshot.row_ok_count;
+        delta.row_fail_count =
+            snapshot.row_fail_count - g_state.stats_last_snapshot.row_fail_count;
+    }
+
+    g_state.stats_last_snapshot = snapshot;
+    g_state.stats_last_log_tp = now;
+    g_state.stats_window_ready = true;
+
     log_info("weld_taos_sink: queue=%zu enqueue_msg=%llu enqueue_row=%llu "
              "drop_msg=%llu drop_row=%llu batch_ok=%llu batch_fail=%llu "
-             "row_ok=%llu row_fail=%llu",
+             "batch_split=%llu non_retryable_fail=%llu row_ok=%llu row_fail=%llu "
+             "window_s=%.2f enqueue_msg_rate=%.2f enqueue_row_rate=%.2f "
+             "drop_msg_rate=%.2f row_ok_rate=%.2f row_fail_rate=%.2f",
         snapshot.queue_depth,
         (unsigned long long) snapshot.enqueue_msg_count,
         (unsigned long long) snapshot.enqueue_row_count,
@@ -591,8 +933,16 @@ log_stats_snapshot(void)
         (unsigned long long) snapshot.drop_row_count,
         (unsigned long long) snapshot.batch_ok_count,
         (unsigned long long) snapshot.batch_fail_count,
+        (unsigned long long) snapshot.batch_split_count,
+        (unsigned long long) snapshot.non_retryable_fail_count,
         (unsigned long long) snapshot.row_ok_count,
-        (unsigned long long) snapshot.row_fail_count);
+        (unsigned long long) snapshot.row_fail_count,
+        elapsed_sec,
+        elapsed_sec > 0.0 ? delta.enqueue_msg_count / elapsed_sec : 0.0,
+        elapsed_sec > 0.0 ? delta.enqueue_row_count / elapsed_sec : 0.0,
+        elapsed_sec > 0.0 ? delta.drop_msg_count / elapsed_sec : 0.0,
+        elapsed_sec > 0.0 ? delta.row_ok_count / elapsed_sec : 0.0,
+        elapsed_sec > 0.0 ? delta.row_fail_count / elapsed_sec : 0.0);
 }
 
 static void
@@ -650,11 +1000,35 @@ flush_rows_with_retry(
                          .time_since_epoch()
                          .count());
     for (int attempt = 0; attempt <= retry_limit; ++attempt) {
-        if (tdengine_exec(g_state.url, g_state.auth_header, sql) == 0) {
+        const TdExecStatus status =
+            tdengine_exec_detailed(g_state.url, g_state.auth_header, sql, NULL);
+        if (status == TdExecStatus::Ok) {
             if (count_stats) {
                 record_batch_result(rows.size(), true);
             }
             return 0;
+        }
+        if (status == TdExecStatus::NonRetryableError) {
+            if (rows.size() > 1) {
+                const size_t mid = rows.size() / 2;
+                std::vector<WeldQueuedRow> left(rows.begin(), rows.begin() + mid);
+                std::vector<WeldQueuedRow> right(rows.begin() + mid, rows.end());
+                g_state.batch_split_count.fetch_add(1);
+                log_warn("weld_taos_sink: non-retryable batch failure, split batch "
+                         "(rows=%zu, left=%zu, right=%zu, attempt=%d)",
+                    rows.size(), left.size(), right.size(), attempt + 1);
+                const int left_rc =
+                    flush_rows_with_retry(left, retry_limit, count_stats);
+                const int right_rc =
+                    flush_rows_with_retry(right, retry_limit, count_stats);
+                return (left_rc == 0 && right_rc == 0) ? 0 : -1;
+            }
+            g_state.non_retryable_fail_count.fetch_add(1);
+            log_error("weld_taos_sink: non-retryable single-row insert failure "
+                      "(msg_id=%s, stable=%s, ts_us=%lld)",
+                rows[0].msg_id.c_str(), rows[0].stable.c_str(),
+                (long long) rows[0].ts_us);
+            break;
         }
         if (attempt < retry_limit) {
             sleep_before_retry(rng);
@@ -742,12 +1116,43 @@ build_create_stable_sql(const std::string &db, const std::string &stable)
 }
 
 static int
+ensure_database_precision_us(void)
+{
+    std::string response;
+
+    if (tdengine_exec_detailed(g_state.url, g_state.auth_header,
+            "SHOW CREATE DATABASE " + g_state.db, &response) !=
+        TdExecStatus::Ok) {
+        log_error("weld_taos_sink: query database precision failed: %s",
+            g_state.db.c_str());
+        return -1;
+    }
+
+    if (!response_contains_precision_us(response)) {
+        log_error("weld_taos_sink: database %s precision is not us; "
+                  "recreate the database with PRECISION 'us' or switch "
+                  "to a new database name", g_state.db.c_str());
+        log_error("weld_taos_sink: SHOW CREATE DATABASE response: %s",
+            response.c_str());
+        return -1;
+    }
+
+    g_state.db_precision_verified = true;
+    return 0;
+}
+
+static int
 ensure_database_ready(const taos_sink_config *cfg)
 {
     if (tdengine_exec(g_state.url, g_state.auth_header,
             "CREATE DATABASE IF NOT EXISTS " + g_state.db +
                 " PRECISION 'us'") != 0) {
         log_error("weld_taos_sink: create database failed");
+        return -1;
+    }
+
+    if (!g_state.db_precision_verified &&
+        ensure_database_precision_us() != 0) {
         return -1;
     }
 
@@ -812,24 +1217,25 @@ same_connection_target(const taos_sink_config *cfg)
 static size_t
 choose_worker_count(void)
 {
+    load_runtime_config_once();
     const unsigned int detected = std::thread::hardware_concurrency();
     if (detected == 0) {
         return 2;
     }
-    if ((size_t) detected < WELD_WORKER_MAX) {
+    if ((size_t) detected < g_state.worker_max) {
         return (size_t) detected;
     }
-    return WELD_WORKER_MAX;
+    return g_state.worker_max;
 }
 
 static int
 can_accept_rows_locked(size_t row_count)
 {
     std::lock_guard<std::mutex> lock(g_state.mutex);
-    if (row_count > WELD_QUEUE_MAX) {
+    if (row_count > g_state.queue_max) {
         return 0;
     }
-    return g_state.queue.size() + row_count <= WELD_QUEUE_MAX ? 1 : 0;
+    return g_state.queue.size() + row_count <= g_state.queue_max ? 1 : 0;
 }
 
 static int
@@ -861,18 +1267,22 @@ start_locked(const taos_sink_config *cfg)
         g_state.auth_header.clear();
         g_state.db.clear();
         g_state.stables.clear();
+        g_state.db_precision_verified = false;
         return -1;
     }
 
     g_state.running = true;
     g_state.started = true;
+    g_state.stats_last_snapshot = WeldStatsSnapshot {};
+    g_state.stats_last_log_tp = std::chrono::steady_clock::now();
+    g_state.stats_window_ready = true;
     const size_t worker_count = choose_worker_count();
     g_state.workers.clear();
     g_state.workers.reserve(worker_count);
     for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
         g_state.workers.emplace_back([worker_index] {
             std::vector<WeldQueuedRow> batch;
-            batch.reserve(WELD_BATCH_SIZE);
+            batch.reserve(g_state.batch_size);
             auto next_stats_log = std::chrono::steady_clock::now() +
                                   std::chrono::milliseconds(WELD_STATS_LOG_MS);
 
@@ -880,7 +1290,7 @@ start_locked(const taos_sink_config *cfg)
                 {
                     std::unique_lock<std::mutex> lock(g_state.mutex);
                     g_state.cv.wait_for(lock,
-                        std::chrono::milliseconds(WELD_FLUSH_MS), [] {
+                        std::chrono::milliseconds(g_state.flush_ms), [] {
                             return !g_state.queue.empty() || !g_state.running;
                         });
 
@@ -889,7 +1299,7 @@ start_locked(const taos_sink_config *cfg)
                     }
 
                     while (!g_state.queue.empty() &&
-                           batch.size() < WELD_BATCH_SIZE) {
+                           batch.size() < g_state.batch_size) {
                         batch.push_back(std::move(g_state.queue.front()));
                         g_state.queue.pop_front();
                     }
@@ -912,8 +1322,9 @@ start_locked(const taos_sink_config *cfg)
             }
         });
     }
-    log_info("weld_taos_sink: started workers=%zu batch_size=%zu queue_max=%zu",
-        worker_count, WELD_BATCH_SIZE, WELD_QUEUE_MAX);
+    log_info("weld_taos_sink: started workers=%zu batch_size=%zu flush_ms=%d "
+             "queue_max=%zu",
+        worker_count, g_state.batch_size, g_state.flush_ms, g_state.queue_max);
 
     return 0;
 }
@@ -1042,11 +1453,11 @@ weld_taos_sink_enqueue_rows_with_config(const taos_sink_config *cfg,
 
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
-        if (g_state.queue.size() + copied.size() > WELD_QUEUE_MAX) {
+        if (g_state.queue.size() + copied.size() > g_state.queue_max) {
             record_enqueue_drop(row_count);
             log_warn("weld_taos_sink: queue full, reject message (%zu rows, "
                      "queue=%zu, max=%zu)",
-                row_count, g_state.queue.size(), WELD_QUEUE_MAX);
+                row_count, g_state.queue.size(), g_state.queue_max);
             return -1;
         }
         for (WeldQueuedRow &row : copied) {
@@ -1111,6 +1522,7 @@ weld_taos_sink_stop_all(void)
     g_state.auth_header.clear();
     g_state.db.clear();
     g_state.stables.clear();
+    g_state.db_precision_verified = false;
     g_state.queue.clear();
     g_state.enqueue_msg_count.store(0);
     g_state.enqueue_row_count.store(0);
@@ -1118,7 +1530,12 @@ weld_taos_sink_stop_all(void)
     g_state.drop_row_count.store(0);
     g_state.batch_ok_count.store(0);
     g_state.batch_fail_count.store(0);
+    g_state.batch_split_count.store(0);
+    g_state.non_retryable_fail_count.store(0);
     g_state.row_ok_count.store(0);
     g_state.row_fail_count.store(0);
+    g_state.stats_last_snapshot = WeldStatsSnapshot {};
+    g_state.stats_last_log_tp = std::chrono::steady_clock::time_point {};
+    g_state.stats_window_ready = false;
     g_state.started = false;
 }

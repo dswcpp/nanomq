@@ -31,6 +31,13 @@ if(ENABLE_TAOS)
             ${PROJECT_SOURCE_DIR}/include)
     add_test(NAME nanomq.weld_telemetry_test COMMAND weld_telemetry_test)
     set_tests_properties(nanomq.weld_telemetry_test PROPERTIES TIMEOUT 60)
+
+    add_executable(weld_taos_sink_test weld_taos_sink_test.cpp)
+    target_link_libraries(weld_taos_sink_test nng)
+    target_include_directories(weld_taos_sink_test PRIVATE
+            ${PROJECT_SOURCE_DIR}/include)
+    add_test(NAME nanomq.weld_taos_sink_test COMMAND weld_taos_sink_test)
+    set_tests_properties(nanomq.weld_taos_sink_test PROPERTIES TIMEOUT 60)
 endif()
 if(ENABLE_PARQUET)
     nanomq_test(parquet_test)

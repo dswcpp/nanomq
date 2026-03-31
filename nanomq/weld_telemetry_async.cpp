@@ -1,8 +1,10 @@
 #include "weld_telemetry_async.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -15,9 +17,9 @@
 
 namespace {
 
-constexpr size_t WELD_PARSE_WORKER_MAX = 4;
-constexpr size_t WELD_PARSE_QUEUE_MAX_MSG = 256;
-constexpr size_t WELD_PARSE_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
+constexpr size_t WELD_PARSE_WORKER_MAX_DEFAULT = 4;
+constexpr size_t WELD_PARSE_QUEUE_MAX_MSG_DEFAULT = 256;
+constexpr size_t WELD_PARSE_QUEUE_MAX_BYTES_DEFAULT = 64 * 1024 * 1024;
 
 struct AsyncRuleConfig {
     std::string host;
@@ -36,12 +38,31 @@ struct AsyncPublishTask {
     uint16_t        packet_id = 0;
 };
 
+struct AsyncStatsSnapshot {
+    size_t   queue_depth = 0;
+    size_t   queue_bytes = 0;
+    uint64_t enqueue_msg_count = 0;
+    uint64_t drop_msg_count = 0;
+    uint64_t parse_ok_count = 0;
+    uint64_t parse_fail_count = 0;
+};
+
 struct AsyncState {
     std::deque<AsyncPublishTask> queue;
     std::vector<std::thread>     workers;
     std::mutex                   mutex;
     std::condition_variable      cv;
+    size_t                       worker_max = WELD_PARSE_WORKER_MAX_DEFAULT;
+    size_t                       queue_max_msg = WELD_PARSE_QUEUE_MAX_MSG_DEFAULT;
+    size_t                       queue_max_bytes = WELD_PARSE_QUEUE_MAX_BYTES_DEFAULT;
     size_t                       queued_bytes = 0;
+    uint64_t                     enqueue_msg_count = 0;
+    uint64_t                     drop_msg_count = 0;
+    uint64_t                     parse_ok_count = 0;
+    uint64_t                     parse_fail_count = 0;
+    AsyncStatsSnapshot           stats_last_snapshot;
+    std::chrono::steady_clock::time_point stats_last_log_tp;
+    bool                         stats_window_ready = false;
     bool                         running = false;
     bool                         started = false;
 };
@@ -50,14 +71,57 @@ AsyncState g_async_state;
 std::mutex g_async_start_mutex;
 
 static size_t
+read_env_size_with_min(
+    const char *name, size_t default_value, size_t min_value)
+{
+    const char *raw = getenv(name);
+    if (raw == NULL || raw[0] == '\0') {
+        return default_value;
+    }
+
+    char *end = NULL;
+    unsigned long long value = strtoull(raw, &end, 10);
+    if (end == raw || (end != NULL && *end != '\0')) {
+        log_warn("weld_telemetry_async: ignore invalid env %s=%s", name, raw);
+        return default_value;
+    }
+
+    if (value < min_value) {
+        log_warn(
+            "weld_telemetry_async: env %s=%s below minimum %zu, clamp to %zu",
+            name, raw, min_value, min_value);
+        return min_value;
+    }
+
+    return (size_t) value;
+}
+
+static void
+load_runtime_config_once(void)
+{
+    static std::once_flag loaded_once;
+    std::call_once(loaded_once, [] {
+        g_async_state.worker_max = read_env_size_with_min(
+            "NANOMQ_WELD_PARSE_WORKER_MAX", WELD_PARSE_WORKER_MAX_DEFAULT, 1);
+        g_async_state.queue_max_msg = read_env_size_with_min(
+            "NANOMQ_WELD_PARSE_QUEUE_MAX_MSG",
+            WELD_PARSE_QUEUE_MAX_MSG_DEFAULT, 1);
+        g_async_state.queue_max_bytes = read_env_size_with_min(
+            "NANOMQ_WELD_PARSE_QUEUE_MAX_BYTES",
+            WELD_PARSE_QUEUE_MAX_BYTES_DEFAULT, 1024);
+    });
+}
+
+static size_t
 choose_worker_count(void)
 {
+    load_runtime_config_once();
     const unsigned int detected = std::thread::hardware_concurrency();
     if (detected == 0) {
         return 2;
     }
-    return detected < WELD_PARSE_WORKER_MAX ? (size_t) detected :
-                                              WELD_PARSE_WORKER_MAX;
+    return detected < g_async_state.worker_max ? (size_t) detected :
+                                                 g_async_state.worker_max;
 }
 
 static size_t
@@ -66,6 +130,66 @@ task_bytes(const AsyncPublishTask &task)
     return task.topic.size() + task.payload.size() + task.rule.host.size() +
            task.rule.username.size() + task.rule.password.size() +
            task.rule.db.size() + task.rule.table.size() + 256;
+}
+
+static void
+log_stats_snapshot(void)
+{
+    AsyncStatsSnapshot snapshot;
+    AsyncStatsSnapshot delta;
+    double             elapsed_sec = 0.0;
+    const auto         now = std::chrono::steady_clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(g_async_state.mutex);
+        snapshot.queue_depth = g_async_state.queue.size();
+        snapshot.queue_bytes = g_async_state.queued_bytes;
+        snapshot.enqueue_msg_count = g_async_state.enqueue_msg_count;
+        snapshot.drop_msg_count = g_async_state.drop_msg_count;
+        snapshot.parse_ok_count = g_async_state.parse_ok_count;
+        snapshot.parse_fail_count = g_async_state.parse_fail_count;
+
+        if (g_async_state.stats_window_ready) {
+            elapsed_sec = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now - g_async_state.stats_last_log_tp)
+                              .count() /
+                          1000.0;
+            delta.enqueue_msg_count =
+                snapshot.enqueue_msg_count -
+                g_async_state.stats_last_snapshot.enqueue_msg_count;
+            delta.drop_msg_count =
+                snapshot.drop_msg_count -
+                g_async_state.stats_last_snapshot.drop_msg_count;
+            delta.parse_ok_count =
+                snapshot.parse_ok_count -
+                g_async_state.stats_last_snapshot.parse_ok_count;
+            delta.parse_fail_count =
+                snapshot.parse_fail_count -
+                g_async_state.stats_last_snapshot.parse_fail_count;
+        }
+
+        g_async_state.stats_last_snapshot = snapshot;
+        g_async_state.stats_last_log_tp = now;
+        g_async_state.stats_window_ready = true;
+    }
+
+    log_info("weld_telemetry_async: queue_msg=%zu queue_bytes=%zu "
+             "enqueue_msg=%llu drop_msg=%llu parse_ok=%llu parse_fail=%llu "
+             "window_s=%.2f enqueue_rate=%.2f drop_rate=%.2f "
+             "parse_ok_rate=%.2f parse_fail_rate=%.2f parse_total_rate=%.2f",
+        snapshot.queue_depth, snapshot.queue_bytes,
+        (unsigned long long) snapshot.enqueue_msg_count,
+        (unsigned long long) snapshot.drop_msg_count,
+        (unsigned long long) snapshot.parse_ok_count,
+        (unsigned long long) snapshot.parse_fail_count,
+        elapsed_sec,
+        elapsed_sec > 0.0 ? delta.enqueue_msg_count / elapsed_sec : 0.0,
+        elapsed_sec > 0.0 ? delta.drop_msg_count / elapsed_sec : 0.0,
+        elapsed_sec > 0.0 ? delta.parse_ok_count / elapsed_sec : 0.0,
+        elapsed_sec > 0.0 ? delta.parse_fail_count / elapsed_sec : 0.0,
+        elapsed_sec > 0.0 ?
+            (delta.parse_ok_count + delta.parse_fail_count) / elapsed_sec :
+            0.0);
 }
 
 static void
@@ -87,8 +211,15 @@ process_task(const AsyncPublishTask &task)
             task.packet_id,
             reinterpret_cast<const uint8_t *>(task.payload.data()),
             (uint32_t) task.payload.size()) != 0) {
+        {
+            std::lock_guard<std::mutex> lock(g_async_state.mutex);
+            g_async_state.parse_fail_count++;
+        }
         log_error("weld_telemetry_async: async parse failed for topic=%s",
             task.topic.c_str());
+    } else {
+        std::lock_guard<std::mutex> lock(g_async_state.mutex);
+        g_async_state.parse_ok_count++;
     }
 }
 
@@ -101,11 +232,16 @@ start_locked(void)
 
     g_async_state.running = true;
     g_async_state.started = true;
+    g_async_state.stats_last_snapshot = AsyncStatsSnapshot {};
+    g_async_state.stats_last_log_tp = std::chrono::steady_clock::now();
+    g_async_state.stats_window_ready = true;
 
     const size_t worker_count = choose_worker_count();
     g_async_state.workers.reserve(worker_count);
     for (size_t i = 0; i < worker_count; ++i) {
-        g_async_state.workers.emplace_back([] {
+        g_async_state.workers.emplace_back([i] {
+            auto next_stats_log = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(30);
             for (;;) {
                 AsyncPublishTask task;
                 size_t           bytes = 0;
@@ -131,13 +267,21 @@ start_locked(void)
                 }
 
                 process_task(task);
+
+                if (i == 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= next_stats_log) {
+                        log_stats_snapshot();
+                        next_stats_log = now + std::chrono::seconds(30);
+                    }
+                }
             }
         });
     }
 
     log_info("weld_telemetry_async: started workers=%zu queue_max_msg=%zu "
              "queue_max_bytes=%zu",
-        worker_count, WELD_PARSE_QUEUE_MAX_MSG, WELD_PARSE_QUEUE_MAX_BYTES);
+        worker_count, g_async_state.queue_max_msg, g_async_state.queue_max_bytes);
     return 0;
 }
 
@@ -164,11 +308,12 @@ weld_telemetry_async_enqueue(const rule_taos *taos_rule,
     task.topic = topic_name;
     task.payload.assign(
         reinterpret_cast<const char *>(payload), payload_len);
-    task.qos = qos;
-    task.packet_id = packet_id;
+	task.qos = qos;
+	task.packet_id = packet_id;
 
-    const size_t bytes = task_bytes(task);
-    if (bytes > WELD_PARSE_QUEUE_MAX_BYTES) {
+	load_runtime_config_once();
+	const size_t bytes = task_bytes(task);
+	if (bytes > g_async_state.queue_max_bytes) {
         log_warn("weld_telemetry_async: drop oversized message bytes=%zu topic=%s",
             bytes, task.topic.c_str());
         return -1;
@@ -181,14 +326,16 @@ weld_telemetry_async_enqueue(const rule_taos *taos_rule,
 
     {
         std::lock_guard<std::mutex> lock(g_async_state.mutex);
-        if (g_async_state.queue.size() >= WELD_PARSE_QUEUE_MAX_MSG ||
-            g_async_state.queued_bytes + bytes > WELD_PARSE_QUEUE_MAX_BYTES) {
+        if (g_async_state.queue.size() >= g_async_state.queue_max_msg ||
+            g_async_state.queued_bytes + bytes > g_async_state.queue_max_bytes) {
+            g_async_state.drop_msg_count++;
             log_warn("weld_telemetry_async: queue full, drop message "
                      "(topic=%s queue_msg=%zu queue_bytes=%zu)",
                 task.topic.c_str(), g_async_state.queue.size(),
                 g_async_state.queued_bytes);
             return -1;
         }
+        g_async_state.enqueue_msg_count++;
         g_async_state.queued_bytes += bytes;
         g_async_state.queue.push_back(std::move(task));
     }
@@ -219,6 +366,13 @@ weld_telemetry_async_stop_all(void)
     g_async_state.workers.clear();
     g_async_state.queue.clear();
     g_async_state.queued_bytes = 0;
+    g_async_state.enqueue_msg_count = 0;
+    g_async_state.drop_msg_count = 0;
+    g_async_state.parse_ok_count = 0;
+    g_async_state.parse_fail_count = 0;
+    g_async_state.stats_last_snapshot = AsyncStatsSnapshot {};
+    g_async_state.stats_last_log_tp = std::chrono::steady_clock::time_point {};
+    g_async_state.stats_window_ready = false;
     g_async_state.running = false;
     g_async_state.started = false;
 }

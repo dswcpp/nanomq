@@ -4,7 +4,7 @@
 
 ## 1. 交付物
 
-- 安装包: [nanomq-nng-v0.24.13-amd64.deb](/home/tery/project/nanomq/build-runtime/_packages/nanomq-nng-v0.24.13-amd64.deb)
+- 安装包: [nanomq-nng-v0.24.14-amd64.deb](/home/tery/project/nanomq/build-runtime/_packages/nanomq-nng-v0.24.14-amd64.deb)
 - MQTT 规则配置: [nanomq_weld_taos.conf](/home/tery/project/nanomq/etc/nanomq_weld_taos.conf)
 - TDengine 建表脚本: [weld_tdengine_schema.sql](/home/tery/project/nanomq/etc/weld_tdengine_schema.sql)
 - TDengine 重建脚本: [weld_tdengine_schema_reset.sql](/home/tery/project/nanomq/etc/weld_tdengine_schema_reset.sql)
@@ -12,7 +12,7 @@
 ## 2. 安装
 
 ```bash
-sudo dpkg -i /home/tery/project/nanomq/build-runtime/_packages/nanomq-nng-v0.24.13-amd64.deb
+sudo dpkg -i /home/tery/project/nanomq/build-runtime/_packages/nanomq-nng-v0.24.14-amd64.deb
 ```
 
 安装后默认文件位置：
