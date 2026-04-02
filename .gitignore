@@ -1,4 +1,15 @@
-# Object files
+################################################################################
+# NanoMQ .gitignore
+#
+# Ignores build artifacts, dependencies, editor files, and development artifacts
+# to keep the repository clean and focused on source code.
+################################################################################
+
+# ============================================================================
+# Compiled Objects & Executables
+# ============================================================================
+
+# C/C++ Object files
 *.o
 *.ko
 *.obj
@@ -8,7 +19,7 @@
 *.gch
 *.pch
 
-# Libraries
+# Static/Shared Libraries
 *.lib
 *.a
 *.la
@@ -20,7 +31,7 @@
 *.so.*
 *.dylib
 
-# Executables
+# Executables and binaries
 *.exe
 *.out
 *.app
@@ -28,39 +39,111 @@
 *.x86_64
 *.hex
 
-# Debug files
+# Debug symbols
 *.dSYM/
 *.su
-.idea/
-.vscode/
-.claude/
+
+# ============================================================================
+# Build & CMake Artifacts
+# ============================================================================
+
+# Default CMake build directories (all variants)
 build/
 build-cmake-*/
+build-deb/
+build-deb-taos/
+build-deb-notests/
+build-deb-debug/
+build-tests/
+build-runtime/
+build-check-fix/
 cmake-build-debug/
+cmake-build-release/
 
-# Local dependency worktrees / clones
+# CPack generated files (for .deb/.rpm/.zip packaging)
+_CPack_Packages/
+*.deb
+*.deb.sig
+
+# CMake generated files
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+CPackConfig.cmake
+CPackSourceConfig.cmake
+Makefile
+
+# Compiled binaries from builds
+nanomq-nng-*.deb
+nanomq-*.deb
+
+# ============================================================================
+# Dependencies & Submodules
+# ============================================================================
+
+# Local dependency worktrees / clones (managed by /scripts or manual setup)
 NanoNNG/
+extern/l8w8jwt/
 
-.DS_Store
+# ============================================================================
+# Generated/Transient Files
+# ============================================================================
 
-# Generate files
+# Generated header files
 fdb_version.h
 
-# Windows DLL leftovers (cross-compiled artifacts in project root)
-libatomic-1.dll
-libwinpthread-1.dll
-
-# Runtime/test artifacts
+# Runtime test artifacts
 tmp/
-build-runtime/
 test_taos.sh
 test_taos_sink.sh
 
-# External dependencies (submodule worktrees / local clones)
-extern/l8w8jwt/
+# ============================================================================
+# Windows Cross-Compilation Artifacts
+# ============================================================================
+# DLL leftovers when cross-compiling for Windows (can appear in project root)
+libatomic-1.dll
+libwinpthread-1.dll
 
-# Editor / OS
+# ============================================================================
+# IDE & Editor
+# ============================================================================
+
+# JetBrains IDEs (IntelliJ, CLion, PhpStorm, etc.)
+.idea/
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# VS Code settings (user-specific)
+.vscode/settings.json
+.vscode/launch.json
+
+# Claude Code local context
+.claude/
+
+# Vim/Neovim temporary files
 *.swp
 *.swo
 *~
+.vim/
+.netrwhist
+
+# ============================================================================
+# OS-Specific Files
+# ============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.DS_Store
+
+# Windows
 Thumbs.db
+desktop.ini
+*.lnk
+
+# Linux
+.directory
+.Trash-*
