@@ -14,6 +14,18 @@
 
 ---
 
+## 1.1 当前交付建议
+
+当前推荐直接使用 Debian 安装包交付：
+
+- `public/0.24.14/nanomq-nng-v0.24.14.deb`
+
+安装后再覆盖以下交付配置：
+
+- `nanomq_weld_taos.conf`
+- `weld_tdengine_schema.sql`
+- `nanomq_pwd.conf`
+
 ## 2. TDengine 数据库初始化
 
 以下 SQL 按顺序执行一次即可，支持重复执行（均使用 `IF NOT EXISTS`）。
@@ -26,6 +38,8 @@ CREATE DATABASE IF NOT EXISTS mqtt_rule PRECISION 'us';
 
 > 精度必须为 `us`（微秒），不可使用默认毫秒精度，否则电流/电压高频点位时间戳会冲突。
 
+> 如果 `mqtt_rule` 已经按旧版焊接表结构创建过，升级到带 `task_id` 的版本前，需要先执行 `ALTER STABLE ... ADD COLUMN task_id NCHAR(128)`，或使用 `etc/weld_tdengine_schema_reset.sql` 重建数据库。
+
 ### 2.2 创建温湿度超表
 
 ```sql
@@ -36,6 +50,7 @@ CREATE STABLE IF NOT EXISTS mqtt_rule.weld_env_point (
     seq               BIGINT,
     topic_name        NCHAR(256),
     spec_ver          NCHAR(32),
+    task_id           NCHAR(128),
     temperature       DOUBLE,
     humidity          DOUBLE,
     quality_code      INT,
@@ -73,6 +88,7 @@ CREATE STABLE IF NOT EXISTS mqtt_rule.weld_flow_point (
     seq               BIGINT,
     topic_name        NCHAR(256),
     spec_ver          NCHAR(32),
+    task_id           NCHAR(128),
     instant_flow      DOUBLE,
     total_flow        DOUBLE,
     quality_code      INT,
@@ -100,83 +116,77 @@ CREATE STABLE IF NOT EXISTS mqtt_rule.weld_flow_point (
 );
 ```
 
-### 2.4 创建电流超表
+### 2.4 创建电流原始消息表
 
 ```sql
-CREATE STABLE IF NOT EXISTS mqtt_rule.weld_current_point (
+CREATE STABLE IF NOT EXISTS mqtt_rule.weld_current_raw (
     ts                TIMESTAMP,
     recv_ts           TIMESTAMP,
-    msg_id            NCHAR(128),
+    msg_id            VARCHAR(128),
     seq               BIGINT,
-    topic_name        NCHAR(256),
-    spec_ver          NCHAR(32),
-    current           DOUBLE,
-    raw_adc_unit      NCHAR(16),
-    cal_version       NCHAR(64),
-    cal_k             DOUBLE,
-    cal_b             DOUBLE,
-    quality_code      INT,
-    quality_text      NCHAR(64),
-    source_bus        NCHAR(32),
-    source_port       NCHAR(64),
-    source_protocol   NCHAR(32),
-    collect_period_ms  INT,
-    collect_timeout_ms INT,
-    collect_retries    INT,
+    topic_name        VARCHAR(256),
+    spec_ver          VARCHAR(32),
+    task_id           VARCHAR(128),
+    signal_type       VARCHAR(32),
     qos               INT,
-    packet_id         INT
+    packet_id         INT,
+    window_start_us   BIGINT,
+    sample_rate_hz    INT,
+    point_count       INT,
+    encoding          VARCHAR(32),
+    payload           VARCHAR(49152),
+    raw_adc_unit      VARCHAR(16),
+    cal_version       VARCHAR(64),
+    cal_k             DOUBLE,
+    cal_b             DOUBLE
 ) TAGS (
-    version           NCHAR(16),
-    site_id           NCHAR(64),
-    line_id           NCHAR(64),
-    station_id        NCHAR(64),
-    gateway_id        NCHAR(64),
-    device_id         NCHAR(64),
-    device_type       NCHAR(64),
-    device_model      NCHAR(64),
-    metric_group      NCHAR(32),
-    signal_type       NCHAR(32),
-    channel_id        NCHAR(32)
+    version           VARCHAR(16),
+    site_id           VARCHAR(64),
+    line_id           VARCHAR(64),
+    station_id        VARCHAR(64),
+    gateway_id        VARCHAR(64),
+    device_id         VARCHAR(64),
+    device_type       VARCHAR(64),
+    device_model      VARCHAR(64),
+    metric_group      VARCHAR(32),
+    channel_id        VARCHAR(32)
 );
 ```
 
-### 2.5 创建电压超表
+### 2.5 创建电压原始消息表
 
 ```sql
-CREATE STABLE IF NOT EXISTS mqtt_rule.weld_voltage_point (
+CREATE STABLE IF NOT EXISTS mqtt_rule.weld_voltage_raw (
     ts                TIMESTAMP,
     recv_ts           TIMESTAMP,
-    msg_id            NCHAR(128),
+    msg_id            VARCHAR(128),
     seq               BIGINT,
-    topic_name        NCHAR(256),
-    spec_ver          NCHAR(32),
-    voltage           DOUBLE,
-    raw_adc_unit      NCHAR(16),
-    cal_version       NCHAR(64),
-    cal_k             DOUBLE,
-    cal_b             DOUBLE,
-    quality_code      INT,
-    quality_text      NCHAR(64),
-    source_bus        NCHAR(32),
-    source_port       NCHAR(64),
-    source_protocol   NCHAR(32),
-    collect_period_ms  INT,
-    collect_timeout_ms INT,
-    collect_retries    INT,
+    topic_name        VARCHAR(256),
+    spec_ver          VARCHAR(32),
+    task_id           VARCHAR(128),
+    signal_type       VARCHAR(32),
     qos               INT,
-    packet_id         INT
+    packet_id         INT,
+    window_start_us   BIGINT,
+    sample_rate_hz    INT,
+    point_count       INT,
+    encoding          VARCHAR(32),
+    payload           VARCHAR(49152),
+    raw_adc_unit      VARCHAR(16),
+    cal_version       VARCHAR(64),
+    cal_k             DOUBLE,
+    cal_b             DOUBLE
 ) TAGS (
-    version           NCHAR(16),
-    site_id           NCHAR(64),
-    line_id           NCHAR(64),
-    station_id        NCHAR(64),
-    gateway_id        NCHAR(64),
-    device_id         NCHAR(64),
-    device_type       NCHAR(64),
-    device_model      NCHAR(64),
-    metric_group      NCHAR(32),
-    signal_type       NCHAR(32),
-    channel_id        NCHAR(32)
+    version           VARCHAR(16),
+    site_id           VARCHAR(64),
+    line_id           VARCHAR(64),
+    station_id        VARCHAR(64),
+    gateway_id        VARCHAR(64),
+    device_id         VARCHAR(64),
+    device_type       VARCHAR(64),
+    device_model      VARCHAR(64),
+    metric_group      VARCHAR(32),
+    channel_id        VARCHAR(32)
 );
 ```
 
@@ -192,8 +202,8 @@ SHOW STABLES;
 ```
 weld_env_point
 weld_flow_point
-weld_current_point
-weld_voltage_point
+weld_current_raw
+weld_voltage_raw
 ```
 
 ---
@@ -226,14 +236,14 @@ rule.taos.event.publish.2.sql="SELECT * FROM \"weld/+/+/+/+/+/telemetry/flow/#\"
 rule.taos.event.publish.2.table="weld_flow_point"
 rule.taos.event.publish.2.parser="weld_telemetry"
 
-# 规则 3：电流（power 主题，signal_type=current）
+# 规则 3：电流原始消息（power 主题，signal_type=current）
 rule.taos.event.publish.3.sql="SELECT * FROM \"weld/+/+/+/+/+/telemetry/power/#\" WHERE payload.signal_type = 'current'"
-rule.taos.event.publish.3.table="weld_current_point"
+rule.taos.event.publish.3.table="weld_current_raw"
 rule.taos.event.publish.3.parser="weld_telemetry"
 
-# 规则 4：电压（power 主题，signal_type=voltage）
+# 规则 4：电压原始消息（power 主题，signal_type=voltage）
 rule.taos.event.publish.4.sql="SELECT * FROM \"weld/+/+/+/+/+/telemetry/power/#\" WHERE payload.signal_type = 'voltage'"
-rule.taos.event.publish.4.table="weld_voltage_point"
+rule.taos.event.publish.4.table="weld_voltage_raw"
 rule.taos.event.publish.4.parser="weld_telemetry"
 ```
 
@@ -255,6 +265,7 @@ rule.taos.event.publish.4.parser="weld_telemetry"
 - `parser="weld_telemetry"` 不可省略，省略后退回通用模式，只保存原始 payload 文本，不做结构化解析
 - 四条规则编号（`.1.`、`.2.`、`.3.`、`.4.`）必须连续，不可跳号
 - 所有四条规则必须指向同一个 `rule.taos.1.*` 连接配置，不支持不同规则写入不同数据库
+- 电流/电压 power 规则现在直接写入 `weld_current_raw` / `weld_voltage_raw`，NanoMQ 不再解码 `uniform_series_binary`、展开采样点或重建每个 `ts_us`，只保存 `window_start_us`、`sample_rate_hz`、`point_count` 以及原始 `data.payload` 供下游恢复时间轴
 
 ---
 
@@ -291,8 +302,8 @@ weld/{version}/{site_id}/{line_id}/{station_id}/{gateway_id}/telemetry/{metric_g
 |------|-----------|-----------|--------|
 | weld_env_point | gw3568_01 | th01 | `weld_env_point_gw3568_01_th01` |
 | weld_flow_point | gw3568_01 | mf01 | `weld_flow_point_gw3568_01_mf01` |
-| weld_current_point | gw3568_01 | chb01 | `weld_current_point_gw3568_01_chb01` |
-| weld_voltage_point | gw3568_01 | chv01 | `weld_voltage_point_gw3568_01_chv01` |
+| weld_current_raw | gw3568_01 | chb01 | `weld_current_raw_gw3568_01_chb01` |
+| weld_voltage_raw | gw3568_01 | chv01 | `weld_voltage_raw_gw3568_01_chv01` |
 
 > 子表名中非字母数字字符自动替换为 `_`。名称超过 192 字节时自动截断并追加哈希后缀，正常现场设备名不会触发截断。
 
@@ -321,8 +332,8 @@ FROM mqtt_rule.weld_env_point
 ORDER BY ts DESC LIMIT 10;
 
 -- 查询电流最新 10 条
-SELECT ts, recv_ts, gateway_id, device_id, current
-FROM mqtt_rule.weld_current_point
+SELECT ts, recv_ts, gateway_id, device_id, topic_name, point_count, encoding
+FROM mqtt_rule.weld_current_raw
 ORDER BY ts DESC LIMIT 10;
 
 -- 查看所有子表
@@ -353,6 +364,7 @@ SHOW mqtt_rule.TABLES;
 | `seq` | BIGINT | 消息序号 |
 | `topic_name` | NCHAR(256) | 完整 MQTT Topic |
 | `spec_ver` | NCHAR(32) | 数据规范版本 |
+| `task_id` | NCHAR(128) | 公共头任务 ID，旧消息为空，当前占位符常见为 `110120119` |
 | `quality_code` | INT | 数据质量码 |
 | `quality_text` | NCHAR(64) | 数据质量描述（可空） |
 | `source_bus` | NCHAR(32) | 采集总线（可空） |
@@ -396,23 +408,33 @@ SHOW mqtt_rule.TABLES;
 | `instant_flow` | DOUBLE | 瞬时流量（单位：L/min） |
 | `total_flow` | DOUBLE | 累计流量，可为 NULL（单位：L） |
 
-**电流（weld_current_point）**
+**电流原始消息（weld_current_raw）**
 
 | 列名 | 类型 | 说明 |
 |------|------|------|
-| `current` | DOUBLE | 电流值（单位：A） |
-| `raw_adc_unit` | NCHAR(16) | 原始 ADC 单位（可空） |
-| `cal_version` | NCHAR(64) | 校准版本（可空） |
+| `signal_type` | VARCHAR(32) | 固定值 `current` |
+| `window_start_us` | BIGINT | 采样窗口起始时间（微秒） |
+| `sample_rate_hz` | INT | 采样率（Hz） |
+| `point_count` | INT | 消息中点数 |
+| `encoding` | VARCHAR(32) | `base64` / `zstd_base64_f32_le` 等 |
+| `payload` | VARCHAR(49152) | 原始 `data.payload`，由客户端自管理时间轴 |
+| `raw_adc_unit` | VARCHAR(16) | 若有则记录 ADC 单位 |
+| `cal_version` | VARCHAR(64) | 若有则记录校准版本 |
 | `cal_k` | DOUBLE | 校准系数 k（可空） |
 | `cal_b` | DOUBLE | 校准系数 b（可空） |
 
-**电压（weld_voltage_point）**
+**电压原始消息（weld_voltage_raw）**
 
 | 列名 | 类型 | 说明 |
 |------|------|------|
-| `voltage` | DOUBLE | 电压值（单位：V） |
-| `raw_adc_unit` | NCHAR(16) | 原始 ADC 单位（可空） |
-| `cal_version` | NCHAR(64) | 校准版本（可空） |
+| `signal_type` | VARCHAR(32) | 固定值 `voltage` |
+| `window_start_us` | BIGINT | 采样窗口起始时间（微秒） |
+| `sample_rate_hz` | INT | 采样率（Hz） |
+| `point_count` | INT | 消息中点数 |
+| `encoding` | VARCHAR(32) | `base64` / `zstd_base64_f32_le` 等 |
+| `payload` | VARCHAR(49152) | 原始 `data.payload`，由客户端自管理时间轴 |
+| `raw_adc_unit` | VARCHAR(16) | 若有则记录 ADC 单位 |
+| `cal_version` | VARCHAR(64) | 若有则记录校准版本 |
 | `cal_k` | DOUBLE | 校准系数 k（可空） |
 | `cal_b` | DOUBLE | 校准系数 b（可空） |
 

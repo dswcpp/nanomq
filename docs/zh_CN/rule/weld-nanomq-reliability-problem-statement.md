@@ -61,7 +61,7 @@
 - HOCON 规则能加载四条焊接 TAOS 规则
 - `parser = weld_telemetry` 已经生效
 - 四类超表模型已可按需创建
-- 合法的电流消息已成功写入 `mqtt_rule.weld_current_point_*`
+- 合法的电流消息已成功写入 `mqtt_rule.weld_current_raw_*`
 
 因此，当前最重要的问题已经从“功能缺失”转变为：
 

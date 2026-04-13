@@ -36,12 +36,17 @@ constexpr size_t TDENGINE_NAME_LIMIT = 192;
 constexpr size_t TDENGINE_HASH_LEN   = 16;
 constexpr size_t TDENGINE_PREFIX_LEN =
     TDENGINE_NAME_LIMIT - 1 - TDENGINE_HASH_LEN;
+constexpr size_t TDENGINE_SQL_MAX_BYTES = 1024 * 1024;
+constexpr size_t WELD_RAW_PAYLOAD_VARCHAR_MAX = 49152;
+constexpr size_t TDENGINE_ROW_MAX_BYTES = 64 * 1024;
 
 enum class StableKind {
     Env,
     Flow,
     Current,
     Voltage,
+    CurrentRaw,
+    VoltageRaw,
     Unknown,
 };
 
@@ -63,6 +68,8 @@ struct WeldQueuedRow {
     int64_t     seq;
     std::string topic_name;
     std::string spec_ver;
+    bool        has_task_id;
+    std::string task_id;
 
     bool        has_temperature;
     double      temperature;
@@ -78,6 +85,16 @@ struct WeldQueuedRow {
     double      current;
     bool        has_voltage;
     double      voltage;
+    bool        has_window_start_us;
+    int64_t     window_start_us;
+    bool        has_sample_rate_hz;
+    int         sample_rate_hz;
+    bool        has_point_count;
+    int         point_count;
+    bool        has_encoding;
+    std::string encoding;
+    bool        has_payload;
+    std::string payload;
 
     bool        has_raw_adc_unit;
     std::string raw_adc_unit;
@@ -251,6 +268,12 @@ get_stable_kind(const std::string &stable)
     if (stable == "weld_voltage_point") {
         return StableKind::Voltage;
     }
+    if (stable == "weld_current_raw") {
+        return StableKind::CurrentRaw;
+    }
+    if (stable == "weld_voltage_raw") {
+        return StableKind::VoltageRaw;
+    }
     return StableKind::Unknown;
 }
 
@@ -294,6 +317,36 @@ build_auth_header(const taos_sink_config *cfg)
     const char *pass = cfg->password != NULL ? cfg->password : "taosdata";
     std::string creds = std::string(user) + ":" + pass;
     return "Basic " + base64_encode(creds);
+}
+
+static const char *
+default_port_for_scheme(const char *scheme)
+{
+    if (scheme == NULL) {
+        return "";
+    }
+    if (strcmp(scheme, "http") == 0) {
+        return "80";
+    }
+    if (strcmp(scheme, "https") == 0) {
+        return "443";
+    }
+    return "";
+}
+
+static std::string
+build_host_header(const nng_url *url)
+{
+    if (url == NULL) {
+        return "";
+    }
+
+    const char *default_port = default_port_for_scheme(url->u_scheme);
+    if (url->u_port != NULL && default_port[0] != '\0' &&
+        strcmp(url->u_port, default_port) == 0) {
+        return url->u_hostname != NULL ? url->u_hostname : "";
+    }
+    return url->u_host != NULL ? url->u_host : "";
 }
 
 static bool
@@ -388,7 +441,6 @@ struct TdHttpReuseContext {
     nng_http_req    *req = NULL;
     nng_http_res    *res = NULL;
     nng_aio         *aio = NULL;
-    nng_http_conn   *conn = NULL;
 
     ~TdHttpReuseContext()
     {
@@ -396,18 +448,8 @@ struct TdHttpReuseContext {
     }
 
     void
-    close_conn()
-    {
-        if (conn != NULL) {
-            nng_http_conn_close(conn);
-            conn = NULL;
-        }
-    }
-
-    void
     reset()
     {
-        close_conn();
         if (aio != NULL) {
             nng_aio_free(aio);
             aio = NULL;
@@ -471,33 +513,6 @@ struct TdHttpReuseContext {
         url_str = target_url;
         return TdExecStatus::Ok;
     }
-
-    TdExecStatus
-    ensure_conn()
-    {
-        if (conn != NULL) {
-            return TdExecStatus::Ok;
-        }
-
-        nng_aio_set_timeout(aio, 5000);
-        nng_http_client_connect(client, aio);
-        nng_aio_wait(aio);
-
-        const int rv = nng_aio_result(aio);
-        if (rv != 0) {
-            log_error(
-                "weld_taos_sink: http connect failed: %s", nng_strerror(rv));
-            close_conn();
-            return TdExecStatus::RetryableError;
-        }
-
-        conn = (nng_http_conn *) nng_aio_get_output(aio, 0);
-        if (conn == NULL) {
-            log_error("weld_taos_sink: http connect returned null conn");
-            return TdExecStatus::RetryableError;
-        }
-        return TdExecStatus::Ok;
-    }
 };
 
 static TdExecStatus
@@ -510,10 +525,6 @@ tdengine_exec_http(const std::string &url_str, const std::string &auth_hdr,
     if (rc != TdExecStatus::Ok) {
         return rc;
     }
-    rc = context.ensure_conn();
-    if (rc != TdExecStatus::Ok) {
-        return rc;
-    }
 
     nng_http_req_reset(context.req);
     nng_http_res_reset(context.res);
@@ -523,7 +534,13 @@ tdengine_exec_http(const std::string &url_str, const std::string &auth_hdr,
                 ? context.url->u_requri
                 : "/") != 0) {
         log_error("weld_taos_sink: req set uri failed");
-        context.close_conn();
+        return TdExecStatus::RetryableError;
+    }
+    const std::string host_header = build_host_header(context.url);
+    if (host_header.empty() ||
+        nng_http_req_set_header(context.req, "Host", host_header.c_str()) !=
+            0) {
+        log_error("weld_taos_sink: req set host failed");
         return TdExecStatus::RetryableError;
     }
     nng_http_req_set_method(context.req, "POST");
@@ -532,15 +549,17 @@ tdengine_exec_http(const std::string &url_str, const std::string &auth_hdr,
     nng_http_req_copy_data(context.req, sql.c_str(), sql.size());
 
     nng_aio_set_timeout(context.aio, 5000);
-    nng_http_conn_transact(
-        context.conn, context.req, context.res, context.aio);
+    // Reusing a persistent nng_http_conn here has produced intermittent
+    // TDengine HTTP 400 responses during bootstrap SQL. Reuse the allocated
+    // client/request objects, but let each transact manage its own connection.
+    nng_http_client_transact(
+        context.client, context.req, context.res, context.aio);
     nng_aio_wait(context.aio);
 
     const int rv = nng_aio_result(context.aio);
     if (rv != 0) {
         log_error(
             "weld_taos_sink: http transact failed: %s", nng_strerror(rv));
-        context.close_conn();
         return TdExecStatus::RetryableError;
     }
 
@@ -646,6 +665,63 @@ sql_optional_int(bool has_value, int64_t value)
     return std::string(buf);
 }
 
+static size_t
+estimate_raw_row_bytes(const WeldQueuedRow &row)
+{
+    size_t bytes = sizeof(row);
+
+    bytes += row.msg_id.size();
+    bytes += row.topic_name.size();
+    bytes += row.spec_ver.size();
+    bytes += row.task_id.size();
+    bytes += row.signal_type.size();
+    bytes += row.encoding.size();
+    bytes += row.payload.size();
+    bytes += row.raw_adc_unit.size();
+    bytes += row.cal_version.size();
+    bytes += row.version.size();
+    bytes += row.site_id.size();
+    bytes += row.line_id.size();
+    bytes += row.station_id.size();
+    bytes += row.gateway_id.size();
+    bytes += row.device_id.size();
+    bytes += row.device_type.size();
+    bytes += row.device_model.size();
+    bytes += row.metric_group.size();
+    bytes += row.channel_id.size();
+    return bytes;
+}
+
+static int
+validate_raw_row_size(const WeldQueuedRow &row)
+{
+    if ((get_stable_kind(row.stable) != StableKind::CurrentRaw) &&
+        (get_stable_kind(row.stable) != StableKind::VoltageRaw)) {
+        return 0;
+    }
+
+    if (!row.has_payload || row.payload.empty()) {
+        log_error("weld_taos_sink: raw payload missing (msg_id=%s stable=%s)",
+            row.msg_id.c_str(), row.stable.c_str());
+        return -1;
+    }
+    if (row.payload.size() > WELD_RAW_PAYLOAD_VARCHAR_MAX) {
+        log_error("weld_taos_sink: raw payload too large (%zu > %zu) "
+                  "(msg_id=%s stable=%s)",
+            row.payload.size(), WELD_RAW_PAYLOAD_VARCHAR_MAX,
+            row.msg_id.c_str(), row.stable.c_str());
+        return -1;
+    }
+    if (estimate_raw_row_bytes(row) > TDENGINE_ROW_MAX_BYTES) {
+        log_error("weld_taos_sink: raw row too large (%zu > %zu) "
+                  "(msg_id=%s stable=%s)",
+            estimate_raw_row_bytes(row), TDENGINE_ROW_MAX_BYTES,
+            row.msg_id.c_str(), row.stable.c_str());
+        return -1;
+    }
+    return 0;
+}
+
 static uint64_t
 fnv1a_64(const std::string &value)
 {
@@ -703,7 +779,8 @@ build_env_insert(const std::string &db, const WeldQueuedRow &row)
            std::to_string((long long) row.recv_ts_us) + "," +
            sql_quoted(row.msg_id) + "," + std::to_string((long long) row.seq) +
            "," + sql_quoted(row.topic_name) + "," + sql_quoted(row.spec_ver) +
-           "," + sql_optional_double(row.has_temperature, row.temperature) +
+           "," + sql_optional_string(row.has_task_id, row.task_id) + "," +
+           sql_optional_double(row.has_temperature, row.temperature) +
            "," + sql_optional_double(row.has_humidity, row.humidity) + "," +
            sql_optional_int(row.has_quality_code, row.quality_code) + "," +
            sql_optional_string(row.has_quality_text, row.quality_text) + "," +
@@ -735,7 +812,8 @@ build_flow_insert(const std::string &db, const WeldQueuedRow &row)
            std::to_string((long long) row.recv_ts_us) + "," +
            sql_quoted(row.msg_id) + "," + std::to_string((long long) row.seq) +
            "," + sql_quoted(row.topic_name) + "," + sql_quoted(row.spec_ver) +
-           "," + sql_optional_double(row.has_instant_flow, row.instant_flow) +
+           "," + sql_optional_string(row.has_task_id, row.task_id) + "," +
+           sql_optional_double(row.has_instant_flow, row.instant_flow) +
            "," + sql_optional_double(row.has_total_flow, row.total_flow) + "," +
            sql_optional_int(row.has_quality_code, row.quality_code) + "," +
            sql_optional_string(row.has_quality_text, row.quality_text) + "," +
@@ -767,7 +845,8 @@ build_current_insert(const std::string &db, const WeldQueuedRow &row)
            std::to_string((long long) row.recv_ts_us) + "," +
            sql_quoted(row.msg_id) + "," + std::to_string((long long) row.seq) +
            "," + sql_quoted(row.topic_name) + "," + sql_quoted(row.spec_ver) +
-           "," + sql_optional_double(row.has_current, row.current) + "," +
+           "," + sql_optional_string(row.has_task_id, row.task_id) + "," +
+           sql_optional_double(row.has_current, row.current) + "," +
            sql_optional_string(row.has_raw_adc_unit, row.raw_adc_unit) + "," +
            sql_optional_string(row.has_cal_version, row.cal_version) + "," +
            sql_optional_double(row.has_cal_k, row.cal_k) + "," +
@@ -802,7 +881,8 @@ build_voltage_insert(const std::string &db, const WeldQueuedRow &row)
            std::to_string((long long) row.recv_ts_us) + "," +
            sql_quoted(row.msg_id) + "," + std::to_string((long long) row.seq) +
            "," + sql_quoted(row.topic_name) + "," + sql_quoted(row.spec_ver) +
-           "," + sql_optional_double(row.has_voltage, row.voltage) + "," +
+           "," + sql_optional_string(row.has_task_id, row.task_id) + "," +
+           sql_optional_double(row.has_voltage, row.voltage) + "," +
            sql_optional_string(row.has_raw_adc_unit, row.raw_adc_unit) + "," +
            sql_optional_string(row.has_cal_version, row.cal_version) + "," +
            sql_optional_double(row.has_cal_k, row.cal_k) + "," +
@@ -819,6 +899,64 @@ build_voltage_insert(const std::string &db, const WeldQueuedRow &row)
            "," + sql_optional_int(row.has_collect_retries, row.collect_retries) +
            "," + std::to_string(row.qos) + "," +
            std::to_string(row.packet_id) + ")";
+}
+
+static std::string
+build_current_raw_insert(const std::string &db, const WeldQueuedRow &row)
+{
+    const std::string sub_table = make_sub_table_name(row);
+    return db + "." + sub_table + " USING " + db + "." + row.stable +
+           " TAGS(" + sql_quoted(row.version) + "," + sql_quoted(row.site_id) +
+           "," + sql_quoted(row.line_id) + "," + sql_quoted(row.station_id) +
+           "," + sql_quoted(row.gateway_id) + "," + sql_quoted(row.device_id) +
+           "," + sql_quoted(row.device_type) + "," +
+           sql_quoted(row.device_model) + "," + sql_quoted(row.metric_group) +
+           "," + sql_quoted(row.channel_id) + ") VALUES(" +
+           std::to_string((long long) row.ts_us) + "," +
+           std::to_string((long long) row.recv_ts_us) + "," +
+           sql_quoted(row.msg_id) + "," + std::to_string((long long) row.seq) +
+           "," + sql_quoted(row.topic_name) + "," + sql_quoted(row.spec_ver) +
+           "," + sql_optional_string(row.has_task_id, row.task_id) + "," +
+           sql_quoted(row.signal_type) + "," + std::to_string(row.qos) + "," +
+           std::to_string(row.packet_id) + "," +
+           sql_optional_int(row.has_window_start_us, row.window_start_us) + "," +
+           sql_optional_int(row.has_sample_rate_hz, row.sample_rate_hz) + "," +
+           sql_optional_int(row.has_point_count, row.point_count) + "," +
+           sql_optional_string(row.has_encoding, row.encoding) + "," +
+           sql_optional_string(row.has_payload, row.payload) + "," +
+           sql_optional_string(row.has_raw_adc_unit, row.raw_adc_unit) + "," +
+           sql_optional_string(row.has_cal_version, row.cal_version) + "," +
+           sql_optional_double(row.has_cal_k, row.cal_k) + "," +
+           sql_optional_double(row.has_cal_b, row.cal_b) + ")";
+}
+
+static std::string
+build_voltage_raw_insert(const std::string &db, const WeldQueuedRow &row)
+{
+    const std::string sub_table = make_sub_table_name(row);
+    return db + "." + sub_table + " USING " + db + "." + row.stable +
+           " TAGS(" + sql_quoted(row.version) + "," + sql_quoted(row.site_id) +
+           "," + sql_quoted(row.line_id) + "," + sql_quoted(row.station_id) +
+           "," + sql_quoted(row.gateway_id) + "," + sql_quoted(row.device_id) +
+           "," + sql_quoted(row.device_type) + "," +
+           sql_quoted(row.device_model) + "," + sql_quoted(row.metric_group) +
+           "," + sql_quoted(row.channel_id) + ") VALUES(" +
+           std::to_string((long long) row.ts_us) + "," +
+           std::to_string((long long) row.recv_ts_us) + "," +
+           sql_quoted(row.msg_id) + "," + std::to_string((long long) row.seq) +
+           "," + sql_quoted(row.topic_name) + "," + sql_quoted(row.spec_ver) +
+           "," + sql_optional_string(row.has_task_id, row.task_id) + "," +
+           sql_quoted(row.signal_type) + "," + std::to_string(row.qos) + "," +
+           std::to_string(row.packet_id) + "," +
+           sql_optional_int(row.has_window_start_us, row.window_start_us) + "," +
+           sql_optional_int(row.has_sample_rate_hz, row.sample_rate_hz) + "," +
+           sql_optional_int(row.has_point_count, row.point_count) + "," +
+           sql_optional_string(row.has_encoding, row.encoding) + "," +
+           sql_optional_string(row.has_payload, row.payload) + "," +
+           sql_optional_string(row.has_raw_adc_unit, row.raw_adc_unit) + "," +
+           sql_optional_string(row.has_cal_version, row.cal_version) + "," +
+           sql_optional_double(row.has_cal_k, row.cal_k) + "," +
+           sql_optional_double(row.has_cal_b, row.cal_b) + ")";
 }
 
 static std::string
@@ -841,6 +979,12 @@ build_batch_insert_sql(const std::string &db,
             break;
         case StableKind::Voltage:
             fragment = build_voltage_insert(db, row);
+            break;
+        case StableKind::CurrentRaw:
+            fragment = build_current_raw_insert(db, row);
+            break;
+        case StableKind::VoltageRaw:
+            fragment = build_voltage_raw_insert(db, row);
             break;
         case StableKind::Unknown:
         default:
@@ -986,10 +1130,43 @@ flush_rows_with_retry(
         return 0;
     }
 
+    for (const WeldQueuedRow &row : rows) {
+        if (validate_raw_row_size(row) != 0) {
+            if (count_stats) {
+                record_batch_result(rows.size(), false);
+            }
+            return -1;
+        }
+    }
+
     const std::string sql = build_batch_insert_sql(g_state.db, rows);
     if (sql.empty()) {
         log_error("weld_taos_sink: build batch sql failed (%zu rows)",
             rows.size());
+        if (count_stats) {
+            record_batch_result(rows.size(), false);
+        }
+        return -1;
+    }
+    if (sql.size() > TDENGINE_SQL_MAX_BYTES) {
+        if (rows.size() > 1) {
+            const size_t mid = rows.size() / 2;
+            std::vector<WeldQueuedRow> left(rows.begin(), rows.begin() + mid);
+            std::vector<WeldQueuedRow> right(rows.begin() + mid, rows.end());
+            g_state.batch_split_count.fetch_add(1);
+            log_warn("weld_taos_sink: batch sql too large, split batch "
+                     "(rows=%zu, sql_bytes=%zu, left=%zu, right=%zu)",
+                rows.size(), sql.size(), left.size(), right.size());
+            const int left_rc =
+                flush_rows_with_retry(left, retry_limit, count_stats);
+            const int right_rc =
+                flush_rows_with_retry(right, retry_limit, count_stats);
+            return (left_rc == 0 && right_rc == 0) ? 0 : -1;
+        }
+        log_error("weld_taos_sink: single-row sql too large (%zu > %zu) "
+                  "(msg_id=%s stable=%s)",
+            sql.size(), TDENGINE_SQL_MAX_BYTES, rows[0].msg_id.c_str(),
+            rows[0].stable.c_str());
         if (count_stats) {
             record_batch_result(rows.size(), false);
         }
@@ -1051,6 +1228,7 @@ build_create_stable_sql(const std::string &db, const std::string &stable)
         return "CREATE STABLE IF NOT EXISTS " + db + "." + stable +
                " (ts TIMESTAMP, recv_ts TIMESTAMP, msg_id NCHAR(128), "
                "seq BIGINT, topic_name NCHAR(256), spec_ver NCHAR(32), "
+               "task_id NCHAR(128), "
                "temperature DOUBLE, humidity DOUBLE, quality_code INT, "
                "quality_text NCHAR(64), source_bus NCHAR(32), "
                "source_port NCHAR(64), source_protocol NCHAR(32), "
@@ -1066,6 +1244,7 @@ build_create_stable_sql(const std::string &db, const std::string &stable)
         return "CREATE STABLE IF NOT EXISTS " + db + "." + stable +
                " (ts TIMESTAMP, recv_ts TIMESTAMP, msg_id NCHAR(128), "
                "seq BIGINT, topic_name NCHAR(256), spec_ver NCHAR(32), "
+               "task_id NCHAR(128), "
                "instant_flow DOUBLE, total_flow DOUBLE, quality_code INT, "
                "quality_text NCHAR(64), source_bus NCHAR(32), "
                "source_port NCHAR(64), source_protocol NCHAR(32), "
@@ -1081,6 +1260,7 @@ build_create_stable_sql(const std::string &db, const std::string &stable)
         return "CREATE STABLE IF NOT EXISTS " + db + "." + stable +
                " (ts TIMESTAMP, recv_ts TIMESTAMP, msg_id NCHAR(128), "
                "seq BIGINT, topic_name NCHAR(256), spec_ver NCHAR(32), "
+               "task_id NCHAR(128), "
                "current DOUBLE, raw_adc_unit NCHAR(16), cal_version NCHAR(64), "
                "cal_k DOUBLE, cal_b DOUBLE, quality_code INT, "
                "quality_text NCHAR(64), source_bus NCHAR(32), "
@@ -1097,6 +1277,7 @@ build_create_stable_sql(const std::string &db, const std::string &stable)
         return "CREATE STABLE IF NOT EXISTS " + db + "." + stable +
                " (ts TIMESTAMP, recv_ts TIMESTAMP, msg_id NCHAR(128), "
                "seq BIGINT, topic_name NCHAR(256), spec_ver NCHAR(32), "
+               "task_id NCHAR(128), "
                "voltage DOUBLE, raw_adc_unit NCHAR(16), cal_version NCHAR(64), "
                "cal_k DOUBLE, cal_b DOUBLE, quality_code INT, "
                "quality_text NCHAR(64), source_bus NCHAR(32), "
@@ -1109,6 +1290,34 @@ build_create_stable_sql(const std::string &db, const std::string &stable)
                "device_type NCHAR(64), device_model NCHAR(64), "
                "metric_group NCHAR(32), signal_type NCHAR(32), "
                "channel_id NCHAR(32))";
+    case StableKind::CurrentRaw:
+        return "CREATE STABLE IF NOT EXISTS " + db + "." + stable +
+               " (ts TIMESTAMP, recv_ts TIMESTAMP, msg_id VARCHAR(128), "
+               "seq BIGINT, topic_name VARCHAR(256), spec_ver VARCHAR(32), "
+               "task_id VARCHAR(128), signal_type VARCHAR(32), qos INT, "
+               "packet_id INT, window_start_us BIGINT, sample_rate_hz INT, "
+               "point_count INT, encoding VARCHAR(32), payload VARCHAR(49152), "
+               "raw_adc_unit VARCHAR(16), cal_version VARCHAR(64), "
+               "cal_k DOUBLE, cal_b DOUBLE) "
+               "TAGS (version VARCHAR(16), site_id VARCHAR(64), "
+               "line_id VARCHAR(64), station_id VARCHAR(64), "
+               "gateway_id VARCHAR(64), device_id VARCHAR(64), "
+               "device_type VARCHAR(64), device_model VARCHAR(64), "
+               "metric_group VARCHAR(32), channel_id VARCHAR(32))";
+    case StableKind::VoltageRaw:
+        return "CREATE STABLE IF NOT EXISTS " + db + "." + stable +
+               " (ts TIMESTAMP, recv_ts TIMESTAMP, msg_id VARCHAR(128), "
+               "seq BIGINT, topic_name VARCHAR(256), spec_ver VARCHAR(32), "
+               "task_id VARCHAR(128), signal_type VARCHAR(32), qos INT, "
+               "packet_id INT, window_start_us BIGINT, sample_rate_hz INT, "
+               "point_count INT, encoding VARCHAR(32), payload VARCHAR(49152), "
+               "raw_adc_unit VARCHAR(16), cal_version VARCHAR(64), "
+               "cal_k DOUBLE, cal_b DOUBLE) "
+               "TAGS (version VARCHAR(16), site_id VARCHAR(64), "
+               "line_id VARCHAR(64), station_id VARCHAR(64), "
+               "gateway_id VARCHAR(64), device_id VARCHAR(64), "
+               "device_type VARCHAR(64), device_model VARCHAR(64), "
+               "metric_group VARCHAR(32), channel_id VARCHAR(32))";
     case StableKind::Unknown:
     default:
         return std::string();
@@ -1199,6 +1408,14 @@ validate_config_and_row(const taos_sink_config *cfg, const weld_taos_row *row)
     if (!taos_sink_valid_identifier(cfg->db) ||
         !taos_sink_valid_identifier(row->stable)) {
         log_error("weld_taos_sink: invalid db or stable identifier");
+        return -1;
+    }
+    if ((get_stable_kind(row->stable) == StableKind::CurrentRaw ||
+            get_stable_kind(row->stable) == StableKind::VoltageRaw) &&
+        (row->has_window_start_us == 0 || row->has_sample_rate_hz == 0 ||
+            row->has_point_count == 0 || row->encoding == NULL ||
+            row->payload == NULL)) {
+        log_error("weld_taos_sink: raw row missing required fields");
         return -1;
     }
     return 0;
@@ -1340,6 +1557,8 @@ copy_row(const weld_taos_row *row)
     out.seq              = row->seq;
     out.topic_name       = row->topic_name != NULL ? row->topic_name : "";
     out.spec_ver         = row->spec_ver != NULL ? row->spec_ver : "";
+    out.has_task_id      = row->task_id != NULL && row->task_id[0] != '\0';
+    out.task_id          = out.has_task_id ? row->task_id : "";
     out.has_temperature  = row->has_temperature != 0;
     out.temperature      = row->temperature;
     out.has_humidity     = row->has_humidity != 0;
@@ -1352,6 +1571,16 @@ copy_row(const weld_taos_row *row)
     out.current          = row->current;
     out.has_voltage      = row->has_voltage != 0;
     out.voltage          = row->voltage;
+    out.has_window_start_us = row->has_window_start_us != 0;
+    out.window_start_us = row->window_start_us;
+    out.has_sample_rate_hz = row->has_sample_rate_hz != 0;
+    out.sample_rate_hz = row->sample_rate_hz;
+    out.has_point_count = row->has_point_count != 0;
+    out.point_count = row->point_count;
+    out.has_encoding = row->encoding != NULL;
+    out.encoding = row->encoding != NULL ? row->encoding : "";
+    out.has_payload = row->payload != NULL;
+    out.payload = row->payload != NULL ? row->payload : "";
     out.has_raw_adc_unit = row->raw_adc_unit != NULL;
     out.raw_adc_unit =
         row->raw_adc_unit != NULL ? row->raw_adc_unit : "";

@@ -365,83 +365,75 @@ CREATE STABLE IF NOT EXISTS mqtt_rule.weld_flow_point (
 );
 ```
 
-### 6.5 电流超表
+### 6.5 电流原始消息表
 
 ```sql
-CREATE STABLE IF NOT EXISTS mqtt_rule.weld_current_point (
+CREATE STABLE IF NOT EXISTS mqtt_rule.weld_current_raw (
     ts                TIMESTAMP,
     recv_ts           TIMESTAMP,
-    msg_id            NCHAR(128),
+    msg_id            VARCHAR(128),
     seq               BIGINT,
-    topic_name        NCHAR(256),
-    spec_ver          NCHAR(32),
-    current           DOUBLE,
-    raw_adc_unit      NCHAR(16),
-    cal_version       NCHAR(64),
-    cal_k             DOUBLE,
-    cal_b             DOUBLE,
-    quality_code      INT,
-    quality_text      NCHAR(64),
-    source_bus        NCHAR(32),
-    source_port       NCHAR(64),
-    source_protocol   NCHAR(32),
-    collect_period_ms INT,
-    collect_timeout_ms INT,
-    collect_retries   INT,
+    topic_name        VARCHAR(256),
+    spec_ver          VARCHAR(32),
+    signal_type       VARCHAR(32),
     qos               INT,
-    packet_id         INT
+    packet_id         INT,
+    window_start_us   BIGINT,
+    sample_rate_hz    INT,
+    point_count       INT,
+    encoding          VARCHAR(32),
+    payload           VARCHAR(49152),
+    raw_adc_unit      VARCHAR(16),
+    cal_version       VARCHAR(64),
+    cal_k             DOUBLE,
+    cal_b             DOUBLE
 ) TAGS (
-    version           NCHAR(16),
-    site_id           NCHAR(64),
-    line_id           NCHAR(64),
-    station_id        NCHAR(64),
-    gateway_id        NCHAR(64),
-    device_id         NCHAR(64),
-    device_type       NCHAR(64),
-    device_model      NCHAR(64),
-    metric_group      NCHAR(32),
-    signal_type       NCHAR(32),
-    channel_id        NCHAR(32)
+    version           VARCHAR(16),
+    site_id           VARCHAR(64),
+    line_id           VARCHAR(64),
+    station_id        VARCHAR(64),
+    gateway_id        VARCHAR(64),
+    device_id         VARCHAR(64),
+    device_type       VARCHAR(64),
+    device_model      VARCHAR(64),
+    metric_group      VARCHAR(32),
+    channel_id        VARCHAR(32)
 );
 ```
 
-### 6.6 电压超表
+### 6.6 电压原始消息表
 
 ```sql
-CREATE STABLE IF NOT EXISTS mqtt_rule.weld_voltage_point (
+CREATE STABLE IF NOT EXISTS mqtt_rule.weld_voltage_raw (
     ts                TIMESTAMP,
     recv_ts           TIMESTAMP,
-    msg_id            NCHAR(128),
+    msg_id            VARCHAR(128),
     seq               BIGINT,
-    topic_name        NCHAR(256),
-    spec_ver          NCHAR(32),
-    voltage           DOUBLE,
-    raw_adc_unit      NCHAR(16),
-    cal_version       NCHAR(64),
-    cal_k             DOUBLE,
-    cal_b             DOUBLE,
-    quality_code      INT,
-    quality_text      NCHAR(64),
-    source_bus        NCHAR(32),
-    source_port       NCHAR(64),
-    source_protocol   NCHAR(32),
-    collect_period_ms INT,
-    collect_timeout_ms INT,
-    collect_retries   INT,
+    topic_name        VARCHAR(256),
+    spec_ver          VARCHAR(32),
+    signal_type       VARCHAR(32),
     qos               INT,
-    packet_id         INT
+    packet_id         INT,
+    window_start_us   BIGINT,
+    sample_rate_hz    INT,
+    point_count       INT,
+    encoding          VARCHAR(32),
+    payload           VARCHAR(49152),
+    raw_adc_unit      VARCHAR(16),
+    cal_version       VARCHAR(64),
+    cal_k             DOUBLE,
+    cal_b             DOUBLE
 ) TAGS (
-    version           NCHAR(16),
-    site_id           NCHAR(64),
-    line_id           NCHAR(64),
-    station_id        NCHAR(64),
-    gateway_id        NCHAR(64),
-    device_id         NCHAR(64),
-    device_type       NCHAR(64),
-    device_model      NCHAR(64),
-    metric_group      NCHAR(32),
-    signal_type       NCHAR(32),
-    channel_id        NCHAR(32)
+    version           VARCHAR(16),
+    site_id           VARCHAR(64),
+    line_id           VARCHAR(64),
+    station_id        VARCHAR(64),
+    gateway_id        VARCHAR(64),
+    device_id         VARCHAR(64),
+    device_type       VARCHAR(64),
+    device_model      VARCHAR(64),
+    metric_group      VARCHAR(32),
+    channel_id        VARCHAR(32)
 );
 ```
 
@@ -458,8 +450,8 @@ CREATE STABLE IF NOT EXISTS mqtt_rule.weld_voltage_point (
 ```text
 weld_env_point_gw3568_01_th01
 weld_flow_point_gw3568_01_mf01
-weld_current_point_gw3568_01_chb01
-weld_voltage_point_gw3568_01_chv01
+weld_current_raw_gw3568_01_chb01
+weld_voltage_raw_gw3568_01_chv01
 ```
 
 要求如下：
@@ -613,11 +605,11 @@ rule.taos.event.publish.2.table="weld_flow_point"
 rule.taos.event.publish.2.parser="weld_telemetry"
 
 rule.taos.event.publish.3.sql="SELECT * FROM \"weld/+/+/+/+/+/telemetry/power/#\" WHERE payload.signal_type = 'current'"
-rule.taos.event.publish.3.table="weld_current_point"
+rule.taos.event.publish.3.table="weld_current_raw"
 rule.taos.event.publish.3.parser="weld_telemetry"
 
 rule.taos.event.publish.4.sql="SELECT * FROM \"weld/+/+/+/+/+/telemetry/power/#\" WHERE payload.signal_type = 'voltage'"
-rule.taos.event.publish.4.table="weld_voltage_point"
+rule.taos.event.publish.4.table="weld_voltage_raw"
 rule.taos.event.publish.4.parser="weld_telemetry"
 ```
 
@@ -628,17 +620,18 @@ rule.taos.event.publish.4.parser="weld_telemetry"
 - `power` 主题必须在规则层通过 `payload.signal_type` 做第一次分流，避免同一消息双命中
 - `weld_telemetry` parser 必须再按 `signal_type` 和 `table` 做第二次一致性校验
 - 运行时一条消息只能写入一张目标表，不允许同时写入电流表和电压表
+- `weld_current_raw` / `weld_voltage_raw` 写入的是原始 `data.payload`，NanoMQ 只记录 `window_start_us`、`sample_rate_hz`、`point_count` 和 `encoding`，不再展开统一采样数据
 
 ### 8.3 配置校验要求
 
 配置加载时必须校验：
 
 - `parser = weld_telemetry` 时，`db` 必须存在
-- `table` 必须是四个受支持超表之一
+- `table` 必须是四个受支持超表之一（`weld_env_point`、`weld_flow_point`、`weld_current_raw`、`weld_voltage_raw`）
 - 同一数据库目标必须一致
 - 不允许不同焊接规则指向不同的 TAOS 目标
-- `weld_current_point` 对应的规则必须包含 `payload.signal_type = 'current'`
-- `weld_voltage_point` 对应的规则必须包含 `payload.signal_type = 'voltage'`
+- `weld_current_raw` 对应的规则必须包含 `payload.signal_type = 'current'`
+- `weld_voltage_raw` 对应的规则必须包含 `payload.signal_type = 'voltage'`
 
 ### 8.4 管理面边界
 
@@ -709,8 +702,8 @@ rule.taos.event.publish.4.parser="weld_telemetry"
 
 - `environment` -> `weld_env_point`
 - `gas_flow` -> `weld_flow_point`
-- `current` -> `weld_current_point`
-- `voltage` -> `weld_voltage_point`
+- `current` -> `weld_current_raw`
+- `voltage` -> `weld_voltage_raw`
 
 ### 9.4 与现有通用 TAOS Sink 的关系
 

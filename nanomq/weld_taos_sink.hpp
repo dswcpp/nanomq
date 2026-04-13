@@ -18,6 +18,7 @@ typedef struct {
     int64_t     seq;
     const char *topic_name;
     const char *spec_ver;
+    const char *task_id;
 
     uint8_t     has_temperature;
     double      temperature;
@@ -33,6 +34,14 @@ typedef struct {
     double      current;
     uint8_t     has_voltage;
     double      voltage;
+    uint8_t     has_window_start_us;
+    int64_t     window_start_us;
+    uint8_t     has_sample_rate_hz;
+    int         sample_rate_hz;
+    uint8_t     has_point_count;
+    int         point_count;
+    const char *encoding;
+    const char *payload;
 
     const char *raw_adc_unit;
     const char *cal_version;

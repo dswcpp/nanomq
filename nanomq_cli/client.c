@@ -1390,7 +1390,7 @@ client_cb(void *arg)
 				nng_sleep_aio(work->opts->interval, work->aio);
 			} else {
 				nng_socket_close(*work->sock);
-				exit(1);
+				exit(0);
 			}
 		}
 		break;
@@ -1511,7 +1511,9 @@ disconnect_cb(nng_pipe p, nng_pipe_ev ev, void *arg)
 	// property *prop;
 	// nng_pipe_get_ptr(p, NNG_OPT_MQTT_DISCONNECT_PROPERTY, &prop);
 	// nng_socket_get?
-	console("disconnected reason : %d\n", reason);
+	if (reason != 0) {
+		console("disconnected reason : %d\n", reason);
+	}
 }
 
 static int

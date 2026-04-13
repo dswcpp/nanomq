@@ -77,6 +77,11 @@ Makefile
 nanomq-nng-*.deb
 nanomq-*.deb
 
+# Release archives and checksums generated under public/
+public/*.zip
+public/*.tar.gz
+public/*/*.deb.sha256
+
 # ============================================================================
 # Dependencies & Submodules
 # ============================================================================

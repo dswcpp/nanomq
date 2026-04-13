@@ -109,4 +109,8 @@ extern dbtree *          get_broker_db(void);
 extern struct hashmap_s *get_hashmap(void);
 extern int               rule_engine_insert_sql(nano_work *work);
 
+#if defined(ENABLE_NANOMQ_TESTS)
+extern void broker_test_run_send_state(nano_work *work, int aio_result);
+#endif
+
 #endif

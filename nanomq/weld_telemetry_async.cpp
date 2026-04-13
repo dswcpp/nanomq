@@ -17,9 +17,12 @@
 
 namespace {
 
-constexpr size_t WELD_PARSE_WORKER_MAX_DEFAULT = 4;
-constexpr size_t WELD_PARSE_QUEUE_MAX_MSG_DEFAULT = 256;
-constexpr size_t WELD_PARSE_QUEUE_MAX_BYTES_DEFAULT = 64 * 1024 * 1024;
+constexpr size_t WELD_PARSE_WORKER_MAX_DEFAULT = 8;
+constexpr size_t WELD_PARSE_QUEUE_MAX_MSG_DEFAULT = 2048;
+constexpr size_t WELD_PARSE_QUEUE_MAX_BYTES_DEFAULT = 256 * 1024 * 1024;
+constexpr double WELD_PARSE_QUEUE_PRESSURE_WARN_RATIO = 0.80;
+constexpr auto WELD_PARSE_QUEUE_PRESSURE_WARN_INTERVAL =
+    std::chrono::seconds(5);
 
 struct AsyncRuleConfig {
     std::string host;
@@ -62,6 +65,9 @@ struct AsyncState {
     uint64_t                     parse_fail_count = 0;
     AsyncStatsSnapshot           stats_last_snapshot;
     std::chrono::steady_clock::time_point stats_last_log_tp;
+    std::chrono::steady_clock::time_point pressure_last_warn_tp;
+    size_t                       queue_high_watermark_msg = 0;
+    size_t                       queue_high_watermark_bytes = 0;
     bool                         stats_window_ready = false;
     bool                         running = false;
     bool                         started = false;
@@ -173,8 +179,17 @@ log_stats_snapshot(void)
         g_async_state.stats_window_ready = true;
     }
 
+    size_t high_watermark_msg = 0;
+    size_t high_watermark_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_async_state.mutex);
+        high_watermark_msg = g_async_state.queue_high_watermark_msg;
+        high_watermark_bytes = g_async_state.queue_high_watermark_bytes;
+    }
+
     log_info("weld_telemetry_async: queue_msg=%zu queue_bytes=%zu "
              "enqueue_msg=%llu drop_msg=%llu parse_ok=%llu parse_fail=%llu "
+             "high_watermark_msg=%zu high_watermark_bytes=%zu "
              "window_s=%.2f enqueue_rate=%.2f drop_rate=%.2f "
              "parse_ok_rate=%.2f parse_fail_rate=%.2f parse_total_rate=%.2f",
         snapshot.queue_depth, snapshot.queue_bytes,
@@ -182,6 +197,7 @@ log_stats_snapshot(void)
         (unsigned long long) snapshot.drop_msg_count,
         (unsigned long long) snapshot.parse_ok_count,
         (unsigned long long) snapshot.parse_fail_count,
+        high_watermark_msg, high_watermark_bytes,
         elapsed_sec,
         elapsed_sec > 0.0 ? delta.enqueue_msg_count / elapsed_sec : 0.0,
         elapsed_sec > 0.0 ? delta.drop_msg_count / elapsed_sec : 0.0,
@@ -280,8 +296,12 @@ start_locked(void)
     }
 
     log_info("weld_telemetry_async: started workers=%zu queue_max_msg=%zu "
-             "queue_max_bytes=%zu",
-        worker_count, g_async_state.queue_max_msg, g_async_state.queue_max_bytes);
+             "queue_max_bytes=%zu env_worker_max=%s env_queue_max_msg=%s "
+             "env_queue_max_bytes=%s",
+        worker_count, g_async_state.queue_max_msg, g_async_state.queue_max_bytes,
+        "NANOMQ_WELD_PARSE_WORKER_MAX",
+        "NANOMQ_WELD_PARSE_QUEUE_MAX_MSG",
+        "NANOMQ_WELD_PARSE_QUEUE_MAX_BYTES");
     return 0;
 }
 
@@ -295,7 +315,7 @@ weld_telemetry_async_enqueue(const rule_taos *taos_rule,
     if (taos_rule == NULL || taos_rule->host == NULL || taos_rule->db == NULL ||
         taos_rule->table == NULL || topic_name == NULL || payload == NULL ||
         payload_len == 0) {
-        return -1;
+        return WELD_TELEMETRY_ASYNC_ERR_INVALID_ARG;
     }
 
     AsyncPublishTask task;
@@ -316,12 +336,12 @@ weld_telemetry_async_enqueue(const rule_taos *taos_rule,
 	if (bytes > g_async_state.queue_max_bytes) {
         log_warn("weld_telemetry_async: drop oversized message bytes=%zu topic=%s",
             bytes, task.topic.c_str());
-        return -1;
+        return WELD_TELEMETRY_ASYNC_ERR_OVERSIZED;
     }
 
     std::lock_guard<std::mutex> guard(g_async_start_mutex);
     if (start_locked() != 0) {
-        return -1;
+        return WELD_TELEMETRY_ASYNC_ERR_START_FAILED;
     }
 
     {
@@ -330,14 +350,45 @@ weld_telemetry_async_enqueue(const rule_taos *taos_rule,
             g_async_state.queued_bytes + bytes > g_async_state.queue_max_bytes) {
             g_async_state.drop_msg_count++;
             log_warn("weld_telemetry_async: queue full, drop message "
-                     "(topic=%s queue_msg=%zu queue_bytes=%zu)",
+                     "(topic=%s queue_msg=%zu queue_bytes=%zu queue_max_msg=%zu "
+                     "queue_max_bytes=%zu)",
                 task.topic.c_str(), g_async_state.queue.size(),
-                g_async_state.queued_bytes);
-            return -1;
+                g_async_state.queued_bytes, g_async_state.queue_max_msg,
+                g_async_state.queue_max_bytes);
+            return WELD_TELEMETRY_ASYNC_ERR_QUEUE_FULL;
         }
         g_async_state.enqueue_msg_count++;
         g_async_state.queued_bytes += bytes;
         g_async_state.queue.push_back(std::move(task));
+        if (g_async_state.queue.size() > g_async_state.queue_high_watermark_msg) {
+            g_async_state.queue_high_watermark_msg = g_async_state.queue.size();
+        }
+        if (g_async_state.queued_bytes > g_async_state.queue_high_watermark_bytes) {
+            g_async_state.queue_high_watermark_bytes = g_async_state.queued_bytes;
+        }
+        const bool msgPressure =
+            g_async_state.queue_max_msg > 0 &&
+            g_async_state.queue.size() >= static_cast<size_t>(
+                g_async_state.queue_max_msg * WELD_PARSE_QUEUE_PRESSURE_WARN_RATIO);
+        const bool bytePressure =
+            g_async_state.queue_max_bytes > 0 &&
+            g_async_state.queued_bytes >= static_cast<size_t>(
+                g_async_state.queue_max_bytes * WELD_PARSE_QUEUE_PRESSURE_WARN_RATIO);
+        const auto now = std::chrono::steady_clock::now();
+        if ((msgPressure || bytePressure) &&
+            (g_async_state.pressure_last_warn_tp == std::chrono::steady_clock::time_point{} ||
+             now - g_async_state.pressure_last_warn_tp >=
+                 WELD_PARSE_QUEUE_PRESSURE_WARN_INTERVAL)) {
+            g_async_state.pressure_last_warn_tp = now;
+            log_warn("weld_telemetry_async: queue pressure topic=%s queue_msg=%zu/%zu "
+                     "queue_bytes=%zu/%zu high_watermark_msg=%zu "
+                     "high_watermark_bytes=%zu",
+                g_async_state.queue.back().topic.c_str(),
+                g_async_state.queue.size(), g_async_state.queue_max_msg,
+                g_async_state.queued_bytes, g_async_state.queue_max_bytes,
+                g_async_state.queue_high_watermark_msg,
+                g_async_state.queue_high_watermark_bytes);
+        }
     }
 
     g_async_state.cv.notify_one();
@@ -372,6 +423,9 @@ weld_telemetry_async_stop_all(void)
     g_async_state.parse_fail_count = 0;
     g_async_state.stats_last_snapshot = AsyncStatsSnapshot {};
     g_async_state.stats_last_log_tp = std::chrono::steady_clock::time_point {};
+    g_async_state.pressure_last_warn_tp = std::chrono::steady_clock::time_point {};
+    g_async_state.queue_high_watermark_msg = 0;
+    g_async_state.queue_high_watermark_bytes = 0;
     g_async_state.stats_window_ready = false;
     g_async_state.running = false;
     g_async_state.started = false;

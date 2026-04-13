@@ -6,8 +6,7 @@
 
 - 安装包: [nanomq-nng-v0.24.14-amd64.deb](/home/tery/project/nanomq/build-runtime/_packages/nanomq-nng-v0.24.14-amd64.deb)
 - MQTT 规则配置: [nanomq_weld_taos.conf](/home/tery/project/nanomq/etc/nanomq_weld_taos.conf)
-- TDengine 建表脚本: [weld_tdengine_schema.sql](/home/tery/project/nanomq/etc/weld_tdengine_schema.sql)
-- TDengine 重建脚本: [weld_tdengine_schema_reset.sql](/home/tery/project/nanomq/etc/weld_tdengine_schema_reset.sql)
+- TDengine 建库建表脚本: [weld_tdengine_schema.sql](/home/tery/project/nanomq/etc/weld_tdengine_schema.sql)
 
 ## 2. 安装
 
@@ -52,10 +51,11 @@ SHOW CREATE DATABASE mqtt_rule;
 
 若不是 `PRECISION 'us'`，不要继续使用旧库。处理方式二选一：
 
-1. 删除旧库后执行重建脚本
+1. 删除旧库后，重新执行同一个初始化脚本
 
 ```bash
-taos < /usr/local/etc/weld_tdengine_schema_reset.sql
+taos -s "DROP DATABASE IF EXISTS mqtt_rule"
+taos < /usr/local/etc/weld_tdengine_schema.sql
 ```
 
 2. 修改 NanoMQ 配置中的 `database`，换一个全新的库名，再按初始化脚本创建
@@ -65,8 +65,10 @@ taos < /usr/local/etc/weld_tdengine_schema_reset.sql
 - 数据库 `mqtt_rule`
 - 超表 `weld_env_point`
 - 超表 `weld_flow_point`
-- 超表 `weld_current_point`
-- 超表 `weld_voltage_point`
+- 超表 `weld_current_raw`
+- 超表 `weld_voltage_raw`
+
+> 电流/电压数据写入原始消息表，NanoMQ 不再解码/展开 `uniform_series_binary`，只保存 payload 与 `window_` 元数据。
 
 ## 5. 配置
 
@@ -102,8 +104,8 @@ nanomq stop
 
 - `weld/+/+/+/+/+/telemetry/env/#` -> `weld_env_point`
 - `weld/+/+/+/+/+/telemetry/flow/#` -> `weld_flow_point`
-- `weld/+/+/+/+/+/telemetry/power/#` 且 `payload.signal_type = 'current'` -> `weld_current_point`
-- `weld/+/+/+/+/+/telemetry/power/#` 且 `payload.signal_type = 'voltage'` -> `weld_voltage_point`
+- `weld/+/+/+/+/+/telemetry/power/#` 且 `payload.signal_type = 'current'` -> `weld_current_raw`
+- `weld/+/+/+/+/+/telemetry/power/#` 且 `payload.signal_type = 'voltage'` -> `weld_voltage_raw`
 
 ## 8. 上线后验证
 
@@ -126,8 +128,8 @@ USE mqtt_rule;
 SHOW STABLES;
 DESCRIBE weld_env_point;
 DESCRIBE weld_flow_point;
-DESCRIBE weld_current_point;
-DESCRIBE weld_voltage_point;
+DESCRIBE weld_current_raw;
+DESCRIBE weld_voltage_raw;
 ```
 
 检查是否已产生子表：
@@ -142,9 +144,11 @@ SHOW TABLES;
 ```sql
 SELECT COUNT(*) FROM weld_env_point;
 SELECT COUNT(*) FROM weld_flow_point;
-SELECT COUNT(*) FROM weld_current_point;
-SELECT COUNT(*) FROM weld_voltage_point;
+SELECT COUNT(*) FROM weld_current_raw;
+SELECT COUNT(*) FROM weld_voltage_raw;
 ```
+
+> 电流/电压的原始消息表不再逐点展开；`payload` 字段保存了 `uniform_series_binary` 的原始字符串，后续需结合 `window_start_us`/`sample_rate_hz`/`point_count` 手动恢复数组。
 
 ## 9. 异常排查
 

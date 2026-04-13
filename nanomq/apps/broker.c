@@ -208,6 +208,79 @@ static nng_optspec cmd_opts[] = {
 // so that we can use this to set the timeout to the correct value for
 // use in poll.
 
+static void
+broker_run_send_state(nano_work *work, int aio_result, bool schedule_recv)
+{
+	int rv = 0;
+
+#if defined(SUPP_RULE_ENGINE)
+	log_debug("broker: flag=%d, option=0x%x, RULE_ENG_OFF=%d",
+		work->flag, work->config->rule_eng.option, RULE_ENG_OFF);
+	if ((work->flag == CMD_PUBLISH ||
+	        work->flag == CMD_PUBLISH_V5) &&
+	    (work->config->rule_eng.option != RULE_ENG_OFF ||
+	        cvector_size(work->config->rule_eng.rules) > 0)) {
+		log_debug("broker: calling rule_engine_insert_sql");
+		rule_engine_insert_sql(work);
+	}
+#endif
+#if defined(SUPP_ICEORYX)
+	if ((work->flag == CMD_PUBLISH ||
+	        work->flag == CMD_PUBLISH_V5) &&
+	        work->msg != NULL &&
+	        true == nano_iceoryx_topic_filter("ice/fwd",
+	        work->pub_packet->var_header.publish.topic_name.body,
+	        work->pub_packet->var_header.publish.topic_name.len)) {
+		if (0 != (rv = nano_iceoryx_send_nng_msg(
+		        work->iceoryx_puber, work->msg, &work->iceoryx_sock))) {
+			log_error("Failed to send iceoryx %d", rv);
+		}
+	}
+#endif
+	hook_entry(work, 0);
+
+	if (NULL != work->msg) {
+		nng_msg_free(work->msg);
+		work->msg = NULL;
+	}
+	if (aio_result != 0) {
+		log_error("SEND nng_ctx_send error %d", aio_result);
+	}
+	if (work->pub_packet != NULL) {
+		free_pub_packet(work->pub_packet);
+		work->pub_packet = NULL;
+	}
+	if (work->pipe_ct->msg_infos != NULL) {
+		cvector_free(work->pipe_ct->msg_infos);
+		work->pipe_ct->msg_infos = NULL;
+		init_pipe_content(work->pipe_ct);
+	}
+	conn_param_free(work->cparam);
+	work->state = RECV;
+	work->flag  = 0;
+	if (!schedule_recv) {
+		return;
+	}
+	if (work->proto == PROTO_MQTT_BROKER) {
+		nng_ctx_recv(work->ctx, work->aio);
+#if defined(SUPP_ICEORYX)
+	} else if (work->proto == PROTO_ICEORYX_BRIDGE) {
+		nng_aio_set_prov_data(work->aio, work->iceoryx_suber);
+		nng_ctx_recv(work->extra_ctx, work->aio);
+#endif
+	} else {
+		nng_ctx_recv(work->extra_ctx, work->aio);
+	}
+}
+
+#if defined(ENABLE_NANOMQ_TESTS)
+void
+broker_test_run_send_state(nano_work *work, int aio_result)
+{
+	broker_run_send_state(work, aio_result, false);
+}
+#endif
+
 void
 server_cb(void *arg)
 {
@@ -646,63 +719,7 @@ server_cb(void *arg)
 		break;
 	case SEND:
 		log_debug("SEND ^^^^ ctx%d ^^^^", work->ctx.id);
-#if defined(SUPP_RULE_ENGINE)
-		log_debug("broker: flag=%d, option=0x%x, RULE_ENG_OFF=%d",
-			work->flag, work->config->rule_eng.option, RULE_ENG_OFF);
-		if ((work->flag == CMD_PUBLISH ||
-		        work->flag == CMD_PUBLISH_V5) &&
-		    (work->config->rule_eng.option != RULE_ENG_OFF ||
-		        cvector_size(work->config->rule_eng.rules) > 0)) {
-			log_debug("broker: calling rule_engine_insert_sql");
-			rule_engine_insert_sql(work);
-		}
-#endif
-#if defined(SUPP_ICEORYX)
-		if ((work->flag == CMD_PUBLISH ||
-		        work->flag == CMD_PUBLISH_V5) &&
-		        work->msg != NULL &&
-		        true == nano_iceoryx_topic_filter("ice/fwd",
-		        work->pub_packet->var_header.publish.topic_name.body,
-		        work->pub_packet->var_header.publish.topic_name.len)) {
-			if (0 != (rv = nano_iceoryx_send_nng_msg(
-			        work->iceoryx_puber, work->msg, &work->iceoryx_sock))) {
-				log_error("Failed to send iceoryx %d", rv);
-			}
-		}
-#endif
-		// external hook here
-		hook_entry(work, 0);
-
-		if (NULL != work->msg) {
-			nng_msg_free(work->msg);
-			work->msg = NULL;
-		}
-		if ((rv = nng_aio_result(work->aio)) != 0) {
-			log_error("SEND nng_ctx_send error %d", rv);
-		}
-		if (work->pub_packet != NULL) {
-			free_pub_packet(work->pub_packet);
-			work->pub_packet = NULL;
-		}
-		if (work->pipe_ct->msg_infos != NULL) {
-			cvector_free(work->pipe_ct->msg_infos);
-			work->pipe_ct->msg_infos = NULL;
-			init_pipe_content(work->pipe_ct);
-		}
-		// free conn_param due to clone in protocol layer
-		conn_param_free(work->cparam);
-		work->state = RECV;
-		work->flag  = 0;
-		if (work->proto == PROTO_MQTT_BROKER) {
-			nng_ctx_recv(work->ctx, work->aio);
-#if defined(SUPP_ICEORYX)
-		} else if (work->proto == PROTO_ICEORYX_BRIDGE) {
-			nng_aio_set_prov_data(work->aio, work->iceoryx_suber);
-			nng_ctx_recv(work->extra_ctx, work->aio);
-#endif
-		} else{
-			nng_ctx_recv(work->extra_ctx, work->aio);
-		}
+		broker_run_send_state(work, nng_aio_result(work->aio), true);
 		break;
 	case END:
 		log_debug("END ^^^^ ctx%d ^^^^ ", work->ctx.id);

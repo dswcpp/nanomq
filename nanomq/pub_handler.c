@@ -7,6 +7,7 @@
 // found online at https://opensource.org/licenses/MIT.
 //
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -85,6 +86,146 @@ nanomq_get_message_drop()
 	return g_msg.initialed ? nng_atomic_get64(g_msg.msg_drop) : 0;
 }
 
+#endif
+
+#if defined(SUPP_TAOS)
+typedef struct {
+	uint64_t weld_rule_match_count;
+	uint64_t weld_current_rule_match_count;
+	uint64_t weld_voltage_rule_match_count;
+	uint64_t weld_async_enqueue_ok_count;
+	uint64_t weld_async_enqueue_fail_count;
+	uint64_t weld_async_queue_full_count;
+	uint64_t weld_async_oversized_count;
+	uint64_t last_log_weld_rule_match_count;
+	uint64_t last_log_weld_async_enqueue_ok_count;
+	uint64_t last_log_weld_async_enqueue_fail_count;
+	nng_time last_log_ts_ms;
+	nng_time next_log_ts_ms;
+} taos_rule_stats;
+
+static taos_rule_stats g_taos_rule_stats = { 0 };
+
+static void
+taos_rule_stats_inc(uint64_t *value)
+{
+	__sync_fetch_and_add(value, 1);
+}
+
+static uint64_t
+taos_rule_stats_read(uint64_t *value)
+{
+	return (uint64_t) __sync_add_and_fetch(value, 0);
+}
+
+static void
+taos_rule_stats_note_match(const char *table)
+{
+	taos_rule_stats_inc(&g_taos_rule_stats.weld_rule_match_count);
+	if (table == NULL) {
+		return;
+	}
+	if (strcmp(table, "weld_current_raw") == 0) {
+		taos_rule_stats_inc(&g_taos_rule_stats.weld_current_rule_match_count);
+	} else if (strcmp(table, "weld_voltage_raw") == 0) {
+		taos_rule_stats_inc(&g_taos_rule_stats.weld_voltage_rule_match_count);
+	}
+}
+
+static void
+taos_rule_stats_note_enqueue_result(int async_rc)
+{
+	if (async_rc == WELD_TELEMETRY_ASYNC_ENQUEUE_OK) {
+		taos_rule_stats_inc(&g_taos_rule_stats.weld_async_enqueue_ok_count);
+		return;
+	}
+	taos_rule_stats_inc(&g_taos_rule_stats.weld_async_enqueue_fail_count);
+	if (async_rc == WELD_TELEMETRY_ASYNC_ERR_QUEUE_FULL) {
+		taos_rule_stats_inc(&g_taos_rule_stats.weld_async_queue_full_count);
+	} else if (async_rc == WELD_TELEMETRY_ASYNC_ERR_OVERSIZED) {
+		taos_rule_stats_inc(&g_taos_rule_stats.weld_async_oversized_count);
+	}
+}
+
+static void
+taos_rule_stats_log_if_due(void)
+{
+	nng_time now_ms = nng_clock();
+	nng_time expected = g_taos_rule_stats.next_log_ts_ms;
+
+	if (expected == 0) {
+		nng_time next = now_ms + 30000;
+		if (!__sync_bool_compare_and_swap(
+		        &g_taos_rule_stats.next_log_ts_ms, 0, next)) {
+			return;
+		}
+		g_taos_rule_stats.last_log_ts_ms = now_ms;
+		return;
+	}
+	if (now_ms < expected) {
+		return;
+	}
+	if (!__sync_bool_compare_and_swap(
+	        &g_taos_rule_stats.next_log_ts_ms, expected, now_ms + 30000)) {
+		return;
+	}
+
+	{
+		uint64_t rule_match = taos_rule_stats_read(
+		    &g_taos_rule_stats.weld_rule_match_count);
+		uint64_t current_match = taos_rule_stats_read(
+		    &g_taos_rule_stats.weld_current_rule_match_count);
+		uint64_t voltage_match = taos_rule_stats_read(
+		    &g_taos_rule_stats.weld_voltage_rule_match_count);
+		uint64_t enqueue_ok = taos_rule_stats_read(
+		    &g_taos_rule_stats.weld_async_enqueue_ok_count);
+		uint64_t enqueue_fail = taos_rule_stats_read(
+		    &g_taos_rule_stats.weld_async_enqueue_fail_count);
+		uint64_t queue_full = taos_rule_stats_read(
+		    &g_taos_rule_stats.weld_async_queue_full_count);
+		uint64_t oversized = taos_rule_stats_read(
+		    &g_taos_rule_stats.weld_async_oversized_count);
+		double elapsed_sec =
+		    g_taos_rule_stats.last_log_ts_ms > 0 &&
+		            now_ms > g_taos_rule_stats.last_log_ts_ms ?
+		        (double) (now_ms - g_taos_rule_stats.last_log_ts_ms) / 1000.0 :
+		        0.0;
+
+		log_info("pub_handler weld_taos: rule_match=%llu current_match=%llu "
+		         "voltage_match=%llu enqueue_ok=%llu enqueue_fail=%llu "
+		         "queue_full=%llu oversized=%llu window_s=%.2f "
+		         "match_rate=%.2f enqueue_ok_rate=%.2f enqueue_fail_rate=%.2f",
+		    (unsigned long long) rule_match,
+		    (unsigned long long) current_match,
+		    (unsigned long long) voltage_match,
+		    (unsigned long long) enqueue_ok,
+		    (unsigned long long) enqueue_fail,
+		    (unsigned long long) queue_full,
+		    (unsigned long long) oversized,
+		    elapsed_sec,
+		    elapsed_sec > 0.0 ?
+		        (rule_match -
+		            g_taos_rule_stats.last_log_weld_rule_match_count) /
+		                elapsed_sec :
+		        0.0,
+		    elapsed_sec > 0.0 ?
+		        (enqueue_ok -
+		            g_taos_rule_stats.last_log_weld_async_enqueue_ok_count) /
+		                elapsed_sec :
+		        0.0,
+		    elapsed_sec > 0.0 ?
+		        (enqueue_fail -
+		            g_taos_rule_stats.last_log_weld_async_enqueue_fail_count) /
+		                elapsed_sec :
+		        0.0);
+
+		g_taos_rule_stats.last_log_weld_rule_match_count = rule_match;
+		g_taos_rule_stats.last_log_weld_async_enqueue_ok_count = enqueue_ok;
+		g_taos_rule_stats.last_log_weld_async_enqueue_fail_count =
+		    enqueue_fail;
+		g_taos_rule_stats.last_log_ts_ms = now_ms;
+	}
+}
 #endif
 
 static char *bytes_to_str(const unsigned char *src, char *dest, int src_len);
@@ -1598,14 +1739,38 @@ rule_engine_insert_sql(nano_work *work)
 
 				if (t != NULL &&
 				    t->parser == RULE_TAOS_PARSER_WELD_TELEMETRY) {
-					if (weld_telemetry_async_enqueue(t,
+					taos_rule_stats_note_match(t->table);
+					int async_rc = weld_telemetry_async_enqueue(t,
 						    pp->var_header.publish.topic_name.body,
 						    pp->fixed_header.qos,
 						    pp->var_header.publish.packet_id,
 						    pp->payload.data,
-						    pp->payload.len) != 0) {
-						log_error(
-						    "weld_telemetry_async_enqueue failed");
+						    pp->payload.len);
+					taos_rule_stats_note_enqueue_result(async_rc);
+					taos_rule_stats_log_if_due();
+					if (async_rc != WELD_TELEMETRY_ASYNC_ENQUEUE_OK) {
+						if (async_rc == WELD_TELEMETRY_ASYNC_ERR_QUEUE_FULL) {
+							log_error("weld_telemetry_async_enqueue failed: queue full "
+							    "(topic=%s table=%s payload_len=%u). "
+							    "Tune NANOMQ_WELD_PARSE_QUEUE_MAX_MSG / "
+							    "NANOMQ_WELD_PARSE_QUEUE_MAX_BYTES if sustained load is expected.",
+							    pp->var_header.publish.topic_name.body,
+							    t->table != NULL ? t->table : "(null)",
+							    pp->payload.len);
+						} else if (async_rc == WELD_TELEMETRY_ASYNC_ERR_OVERSIZED) {
+							log_error("weld_telemetry_async_enqueue failed: oversized payload "
+							    "(topic=%s table=%s payload_len=%u)",
+							    pp->var_header.publish.topic_name.body,
+							    t->table != NULL ? t->table : "(null)",
+							    pp->payload.len);
+						} else {
+							log_error("weld_telemetry_async_enqueue failed: rc=%d "
+							    "(topic=%s table=%s payload_len=%u)",
+							    async_rc,
+							    pp->var_header.publish.topic_name.body,
+							    t->table != NULL ? t->table : "(null)",
+							    pp->payload.len);
+						}
 					}
 					continue;
 				}
