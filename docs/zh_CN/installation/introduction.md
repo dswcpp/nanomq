@@ -23,6 +23,10 @@
 对于 Windows 用户，NanoMQ 支持直接下载 EXE 可执行文件的方式和 MSI 安装包的形式使用。
 或者您可以参考此篇文章自己进行编译安装: https://www.emqx.com/zh/blog/install-mqtt-broker-on-windows
 
+如果需要在 Ubuntu 环境下自行交叉打包 Windows 64 位 ZIP 包和 EXE 安装包，可参考：
+
+- [Ubuntu 下交叉打包 Windows 64 位安装包](./windows-cross-package.md)
+
 **[通过源代码编译安装](./build-options.md)**
 
 NanoMQ 同样支持基于从源代码编译和安装，若您需要启用 NanoMQ 的高级功能，本节同时提供了教程文档，以便更好地满足进阶需求。

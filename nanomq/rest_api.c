@@ -29,6 +29,7 @@
 #include "include/version.h"
 #include "include/mqtt_api.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -1231,8 +1232,9 @@ get_uptime(char *str, size_t str_len)
 	nng_time mins   = uptime / 1000 / 60 % 60;
 	nng_time secs   = uptime / 1000 % 60;
 
-	snprintf(str, str_len, "%lu Hours, %lu minutes, %lu seconds", hours,
-	    mins, secs);
+	snprintf(str, str_len,
+	    "%" PRIu64 " Hours, %" PRIu64 " minutes, %" PRIu64 " seconds",
+	    (uint64_t) hours, (uint64_t) mins, (uint64_t) secs);
 }
 
 static void
@@ -1779,7 +1781,7 @@ get_metrics(http_msg *msg, kv **params, size_t param_num,
 	char cpu[16] = { 0 };
 	char mem[64] = { 0 };
 	snprintf(cpu, 16, "%.2f%%", stats.cpu_percent);
-	snprintf(mem, 64, "%ld", stats.memory);
+	snprintf(mem, 64, "%" PRIu64, (uint64_t) stats.memory);
 
 	cJSON_AddItemToObject(res_obj, "metrics", metrics);
 	cJSON_AddStringToObject(res_obj, "cpuinfo", cpu);
@@ -3507,9 +3509,10 @@ send_publish(nng_socket *sock, const char *clientid, char *payload,
 			nng_strfree(encode_data);
 		} else if (decode_base64){
 			size_t out_size = BASE64_DECODE_OUT_SIZE(payload_len);
-			char * decode_data = nng_zalloc(out_size);
+			unsigned char *decode_data = nng_zalloc(out_size);
 			size_t len         = base64_decode(
-							(uint8_t *) payload, payload_len, decode_data);
+							(const char *) payload, (unsigned int) payload_len,
+							decode_data);
 			if (len > 0) {
 				nng_mqtt_msg_set_publish_payload(
 				    pub_msg, (uint8_t *) decode_data, len);
@@ -3517,7 +3520,7 @@ send_publish(nng_socket *sock, const char *clientid, char *payload,
 				nng_mqtt_msg_set_publish_payload(
 				    pub_msg, NULL, 0);
 			}
-			nng_strfree(decode_data);
+			nng_strfree((char *) decode_data);
 		} else {
 			nng_mqtt_msg_set_publish_payload(
 			    pub_msg, (uint8_t *) payload, payload_len);
@@ -4092,11 +4095,11 @@ put_mqtt_bridge_switch(http_msg *msg, const char *name)
 		return error_response(msg, NNG_HTTP_STATUS_BAD_REQUEST,
 		    REQ_PARAMS_JSON_FORMAT_ILLEGAL);
 	}
-	int  		 rv;
+	int          rv = 0;
 	bool         found = false;
-	bool         bridge_switch;
+	bool         bridge_switch = false;
 	cJSON       *conf_data = cJSON_GetObjectItem(req, "data");
-	cJSON       *item;
+	cJSON       *item = NULL;
 	conf        *config = get_global_conf();
 	conf_bridge *bridge = &config->bridge;
 	for (size_t i = 0; i < bridge->count; i++) {
@@ -4130,7 +4133,14 @@ put_mqtt_bridge_switch(http_msg *msg, const char *name)
 		}
 	}
 
-	if (found && rv == 0) {
+	if (!found) {
+		cJSON_Delete(req);
+		log_warn("no such %s bridge is found!", name);
+		return error_response(
+		    msg, NNG_HTTP_STATUS_NO_CONTENT, REQ_PARAM_ERROR);
+	}
+
+	if (rv == 0) {
 		cJSON *res_obj = cJSON_CreateObject();
 		cJSON_AddNumberToObject(res_obj, "code", SUCCEED);
 		char *dest = cJSON_PrintUnformatted(res_obj);
@@ -4142,22 +4152,25 @@ put_mqtt_bridge_switch(http_msg *msg, const char *name)
 		cJSON_Delete(res_obj);
 		cJSON_Delete(req);
 		return res;
-	} else if (rv == NNG_ESTATE) {
+	}
+
+	if (rv == NNG_ESTATE) {
 		cJSON_Delete(req);
 		log_warn("change %s bridge state failed!", name);
 		return error_response(
 		    msg, NNG_HTTP_STATUS_BAD_REQUEST, REQ_PARAM_ERROR);
-	} else if (rv != 0){
+	}
+
+	if (rv != 0) {
 		cJSON_Delete(req);
 		log_warn("change %s bridge is failed!", name);
 		return error_response(
 		    msg, NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR, rv);
-	} else if (!found) {
-		cJSON_Delete(req);
-		log_warn("no such %s bridge is found!", name);
-		return error_response(
-		    msg, NNG_HTTP_STATUS_NO_CONTENT, REQ_PARAM_ERROR);
 	}
+
+	cJSON_Delete(req);
+	return error_response(
+	    msg, NNG_HTTP_STATUS_INTERNAL_SERVER_ERROR, UNKNOWN_MISTAKE);
 }
 
 static void

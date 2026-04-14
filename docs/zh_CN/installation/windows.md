@@ -2,6 +2,10 @@
 
 本章节将指导您如何在 Windows 系统中通过 zip 的形式下载安装并启动 NanoMQ。
 
+如果您不是在 Windows 上直接使用现成安装包，而是希望在 Ubuntu 环境下自行交叉打包 Windows 64 位 ZIP 包或 EXE 安装包，请参考：
+
+- [在 Ubuntu 上交叉打包 Windows 64 位 NanoMQ 安装包](./windows-cross-package.md)
+
 ::: tip
 
 本页将以安装 NanoMQ 0.18.2 为例进行演示，如希望使用其他版本，可参考 [NanoMQ 下载](https://nanomq.io/zh/downloads?os=Windows) 页面.

@@ -49,6 +49,7 @@
 
 # Default CMake build directories (all variants)
 build/
+build-win*/
 build-cmake-*/
 build-deb/
 build-deb-taos/
@@ -62,6 +63,8 @@ cmake-build-release/
 
 # CPack generated files (for .deb/.rpm/.zip packaging)
 _CPack_Packages/
+dist-win*/
+install-win*/
 *.deb
 *.deb.sig
 

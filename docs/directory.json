@@ -26,6 +26,10 @@
           "path": "installation/windows"
         },
         {
+          "title": "Ubuntu 打包 Windows",
+          "path": "installation/windows-cross-package"
+        },
+        {
           "title": "编译安装",
           "path": "installation/build-options"
         }

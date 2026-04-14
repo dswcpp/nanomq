@@ -29,7 +29,9 @@ if(ENABLE_JWT)
 endif(ENABLE_JWT)
 
 add_subdirectory(apps)
-add_subdirectory(tests)
+if(NANOMQ_TESTS)
+  add_subdirectory(tests)
+endif()
 
 # set(PARALLEL 128 CACHE STRING "Parallelism (min 4, max 1000)")
 
@@ -163,8 +165,6 @@ if(BUILD_STATIC)
 else()
   target_link_libraries(nanomq nng)
 endif()
-
-target_link_libraries(nanomq sqlite3)
 
 target_compile_definitions(nanomq PRIVATE -DPARALLEL=${PARALLEL})
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

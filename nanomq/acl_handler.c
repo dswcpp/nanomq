@@ -21,7 +21,7 @@ match_rule_content_str(acl_rule_ct *ct, const char *cmp_str)
 }
 
 static char * 
-replace_placeholder(char *origin, const char *placeholder, const char *replacement)
+replace_placeholder(const char *origin, const char *placeholder, const char *replacement)
 {
 	size_t originLen      = strlen(origin);
 	size_t placeholderLen = strlen(placeholder);
@@ -63,7 +63,7 @@ replace_placeholder(char *origin, const char *placeholder, const char *replaceme
 static char *
 replace_topic(const char *origin, conn_param *param)
 {
-	char *topic = origin;
+	const char *topic = origin;
 	char *out_topic  = NULL;
 
 	if (origin == NULL)
@@ -79,12 +79,12 @@ replace_topic(const char *origin, conn_param *param)
 		out_topic = replace_placeholder(topic, placeholder_username,
 		    (const char *) conn_param_get_username(param));
 		if (topic != origin) {
-			nng_strfree(topic);
+			nng_strfree((char *) topic);
 		}
 		topic = out_topic;
 	}
 	if (out_topic == NULL)
-		out_topic = topic;
+		out_topic = (char *) topic;
 	return out_topic;
 }
 
