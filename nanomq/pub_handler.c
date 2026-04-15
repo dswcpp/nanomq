@@ -10,6 +10,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #if defined(SUPP_MYSQL)
 #include <mysql.h>
@@ -106,16 +109,59 @@ typedef struct {
 
 static taos_rule_stats g_taos_rule_stats = { 0 };
 
+#if defined(_WIN32)
 static void
-taos_rule_stats_inc(uint64_t *value)
+taos_rule_stats_atomic_inc(uint64_t *value)
+{
+	InterlockedIncrement64((volatile LONG64 *) value);
+}
+
+static uint64_t
+taos_rule_stats_atomic_read(uint64_t *value)
+{
+	return (uint64_t) InterlockedCompareExchange64(
+	    (volatile LONG64 *) value, 0, 0);
+}
+
+static bool
+taos_rule_stats_atomic_cas_time(
+    nng_time *target, nng_time expected, nng_time desired)
+{
+	return InterlockedCompareExchange64((volatile LONG64 *) target,
+	           (LONG64) desired, (LONG64) expected) ==
+	    (LONG64) expected;
+}
+#else
+static void
+taos_rule_stats_atomic_inc(uint64_t *value)
 {
 	__sync_fetch_and_add(value, 1);
 }
 
 static uint64_t
-taos_rule_stats_read(uint64_t *value)
+taos_rule_stats_atomic_read(uint64_t *value)
 {
 	return (uint64_t) __sync_add_and_fetch(value, 0);
+}
+
+static bool
+taos_rule_stats_atomic_cas_time(
+    nng_time *target, nng_time expected, nng_time desired)
+{
+	return __sync_bool_compare_and_swap(target, expected, desired);
+}
+#endif
+
+static void
+taos_rule_stats_inc(uint64_t *value)
+{
+	taos_rule_stats_atomic_inc(value);
+}
+
+static uint64_t
+taos_rule_stats_read(uint64_t *value)
+{
+	return taos_rule_stats_atomic_read(value);
 }
 
 static void
@@ -155,7 +201,7 @@ taos_rule_stats_log_if_due(void)
 
 	if (expected == 0) {
 		nng_time next = now_ms + 30000;
-		if (!__sync_bool_compare_and_swap(
+		if (!taos_rule_stats_atomic_cas_time(
 		        &g_taos_rule_stats.next_log_ts_ms, 0, next)) {
 			return;
 		}
@@ -165,7 +211,7 @@ taos_rule_stats_log_if_due(void)
 	if (now_ms < expected) {
 		return;
 	}
-	if (!__sync_bool_compare_and_swap(
+	if (!taos_rule_stats_atomic_cas_time(
 	        &g_taos_rule_stats.next_log_ts_ms, expected, now_ms + 30000)) {
 		return;
 	}

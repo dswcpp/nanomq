@@ -8,7 +8,7 @@
 //
 
 #include "include/nanomq.h"
-#include "include/process.h"
+#include "include/nmq_process.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

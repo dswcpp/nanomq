@@ -4,7 +4,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "include/process.h"
+#include "include/nmq_process.h"
 
 static int
 child_exit_with_code(void *arg)

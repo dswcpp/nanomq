@@ -10,7 +10,7 @@
 #include "include/nanomq.h"
 #include "include/broker.h"
 #include "include/const_strings.h"
-#include "include/process.h"
+#include "include/nmq_process.h"
 #include "include/version.h"
 #include "nng/supplemental/nanolib/cmd.h"
 

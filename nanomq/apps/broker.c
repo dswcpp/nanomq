@@ -39,7 +39,7 @@
 #include "include/nanomq_rule.h"
 #include "include/mqtt_api.h"
 #include "include/nanomq.h"
-#include "include/process.h"
+#include "include/nmq_process.h"
 #include "include/pub_handler.h"
 #include "include/sub_handler.h"
 #include "include/unsub_handler.h"
@@ -48,7 +48,7 @@
 #include "include/webhook_post.h"
 #include "include/webhook_inproc.h"
 #include "include/cmd_proc.h"
-#include "include/process.h"
+#include "include/nmq_process.h"
 #include "include/version.h"
 
 #if defined(SUPP_ICEORYX)

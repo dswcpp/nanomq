@@ -5,14 +5,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <sys/time.h>
+#endif
+#if defined(NANOMQ_HAS_ZSTD)
 #include <zstd.h>
+#endif
 
 #include "include/pub_handler.h"
 #include "nng/supplemental/nanolib/base64.h"
 #include "nng/supplemental/nanolib/cJSON.h"
 #include "nng/supplemental/nanolib/log.h"
 #include "weld_taos_sink.hpp"
+
+#if defined(_WIN32)
+#define strtok_r strtok_s
+#endif
 
 typedef struct {
 	char *version;
@@ -61,6 +71,46 @@ typedef struct {
 
 static weld_telemetry_stats g_weld_telemetry_stats = { 0 };
 
+#if defined(_WIN32)
+static int64_t
+weld_now_epoch_us(void)
+{
+	FILETIME        ft;
+	ULARGE_INTEGER  uli;
+
+	GetSystemTimeAsFileTime(&ft);
+	uli.LowPart  = ft.dwLowDateTime;
+	uli.HighPart = ft.dwHighDateTime;
+	return (int64_t) ((uli.QuadPart - 116444736000000000ULL) / 10ULL);
+}
+
+static void
+weld_stats_inc(uint64_t *value)
+{
+	InterlockedIncrement64((volatile LONG64 *) value);
+}
+
+static void
+weld_stats_add(uint64_t *value, uint64_t delta)
+{
+	InterlockedAdd64((volatile LONG64 *) value, (LONG64) delta);
+}
+
+static uint64_t
+weld_stats_read(uint64_t *value)
+{
+	return (uint64_t) InterlockedCompareExchange64(
+	    (volatile LONG64 *) value, 0, 0);
+}
+
+static bool
+weld_stats_cas_i64(int64_t *target, int64_t expected, int64_t desired)
+{
+	return InterlockedCompareExchange64((volatile LONG64 *) target,
+	           (LONG64) desired, (LONG64) expected) ==
+	    (LONG64) expected;
+}
+#else
 static int64_t
 weld_now_epoch_us(void)
 {
@@ -75,11 +125,24 @@ weld_stats_inc(uint64_t *value)
 	__sync_fetch_and_add(value, 1);
 }
 
+static void
+weld_stats_add(uint64_t *value, uint64_t delta)
+{
+	__sync_fetch_and_add(value, delta);
+}
+
 static uint64_t
 weld_stats_read(uint64_t *value)
 {
 	return (uint64_t) __sync_add_and_fetch(value, 0);
 }
+
+static bool
+weld_stats_cas_i64(int64_t *target, int64_t expected, int64_t desired)
+{
+	return __sync_bool_compare_and_swap(target, expected, desired);
+}
+#endif
 
 static void
 weld_stats_inc_table_accept(const char *table)
@@ -112,7 +175,7 @@ weld_log_stats_if_due(int64_t now_us)
 	int64_t expected = g_weld_telemetry_stats.next_log_ts_us;
 	if (expected == 0) {
 		int64_t next = now_us + 30000000LL;
-		if (!__sync_bool_compare_and_swap(
+		if (!weld_stats_cas_i64(
 		        &g_weld_telemetry_stats.next_log_ts_us, 0, next)) {
 			return;
 		}
@@ -122,7 +185,7 @@ weld_log_stats_if_due(int64_t now_us)
 	if (now_us < expected) {
 		return;
 	}
-	if (!__sync_bool_compare_and_swap(&g_weld_telemetry_stats.next_log_ts_us,
+	if (!weld_stats_cas_i64(&g_weld_telemetry_stats.next_log_ts_us,
 	        expected, now_us + 30000000LL)) {
 		return;
 	}
@@ -825,6 +888,7 @@ weld_decode_uniform_binary_payload(const char *encoding,
 	}
 
 	if (strcmp(encoding, "zstd_base64_f32_le") == 0) {
+#if defined(NANOMQ_HAS_ZSTD)
 		size_t rv;
 
 		decoded = (uint8_t *) nng_alloc(expected_len);
@@ -842,6 +906,10 @@ weld_decode_uniform_binary_payload(const char *encoding,
 		*samples_out = decoded;
 		*sample_len_out = rv;
 		return 0;
+#else
+		log_error("weld_telemetry: zstd payload decoding not enabled in this build");
+		goto fail;
+#endif
 	}
 
 	log_error("weld_telemetry: unsupported uniform encoding");
@@ -1142,8 +1210,7 @@ weld_telemetry_handle_publish(
 			rc = 0;
 			weld_stats_inc(&g_weld_telemetry_stats.accept_msg_count);
 			weld_stats_inc_table_accept(taos_rule->table);
-			__sync_fetch_and_add(
-			    &g_weld_telemetry_stats.accept_point_count,
+			weld_stats_add(&g_weld_telemetry_stats.accept_point_count,
 			    (uint64_t) row.point_count);
 		goto done;
 	}
@@ -1334,7 +1401,7 @@ weld_telemetry_handle_publish(
 	rc = 0;
 	weld_stats_inc(&g_weld_telemetry_stats.accept_msg_count);
 	weld_stats_inc_table_accept(taos_rule->table);
-	__sync_fetch_and_add(
+	weld_stats_add(
 	    &g_weld_telemetry_stats.accept_point_count, (uint64_t) point_count);
 
 done:

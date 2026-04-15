@@ -1,14 +1,38 @@
-#ifndef PROCESS_H
-#define PROCESS_H
+#pragma once
+#ifndef _INC_PROCESS
+#define _INC_PROCESS
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+#if defined(_WIN32)
+#include <corecrt.h>
+#include <corecrt_startup.h>
+#include <corecrt_wprocess.h>
+
+_CRT_BEGIN_C_HEADER
+
+typedef void     (__cdecl*   _beginthread_proc_type)(void *);
+typedef unsigned (__stdcall* _beginthreadex_proc_type)(void *);
+
+_ACRTIMP uintptr_t __cdecl _beginthread(
+    _In_     _beginthread_proc_type _StartAddress,
+    _In_     unsigned               _StackSize,
+    _In_opt_ void *                 _ArgList);
+
+_ACRTIMP void __cdecl _endthread(void);
+
+_Success_(return != 0)
+_ACRTIMP uintptr_t __cdecl _beginthreadex(
+    _In_opt_  void *                    _Security,
+    _In_      unsigned                  _StackSize,
+    _In_      _beginthreadex_proc_type  _StartAddress,
+    _In_opt_  void *                    _ArgList,
+    _In_      unsigned                  _InitFlag,
+    _Out_opt_ unsigned *                _ThrdAddr);
+
+_ACRTIMP void __cdecl _endthreadex(_In_ unsigned _ReturnCode);
+
+_CRT_END_C_HEADER
 #endif
 
-extern int process_is_alive(int pid);
-extern int process_send_signal(int pid, int signal);
-extern int pidgrp_send_signal(int pid, int signal);
-extern int process_daemonize(void);
-extern int process_create_child(int (*child_run)(void *), void *data);
+#include "nmq_process.h"
 
 #endif
