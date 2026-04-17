@@ -125,6 +125,14 @@
         {
           "title": "通过配置项配置规则",
           "path": "rule/config-rule-engine"
+        },
+        {
+          "title": "麒麟系统 deb 运维部署",
+          "path": "rule/kylin-deb-ops-guide"
+        },
+        {
+          "title": "麒麟现场排障修复记录",
+          "path": "rule/kylin-nanomq-taos-troubleshooting-record-2026-04-16"
         }
       ]
     },

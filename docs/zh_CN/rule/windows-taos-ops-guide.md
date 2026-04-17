@@ -78,15 +78,21 @@ taos < weld_tdengine_schema.sql
 如果你要在 Windows 侧通过 REST 验证数据库是否已建好，可执行：
 
 ```powershell
-$auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('root:taosdata'))
+$taosHost = '192.168.204.128'
+$taosPort = 6041
+$taosUser = '请替换为 nanomq_weld_taos.conf 中实际配置的用户名'
+$taosPassword = '请替换为 nanomq_weld_taos.conf 中实际配置的密码'
+$auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${taosUser}:${taosPassword}"))
 Invoke-WebRequest `
-  -Uri 'http://192.168.204.128:6041/rest/sql' `
+  -Uri "http://${taosHost}:${taosPort}/rest/sql" `
   -Method Post `
   -Headers @{ Authorization = $auth } `
   -Body 'SHOW DATABASES;' `
   -UseBasicParsing |
 Select-Object -ExpandProperty Content
 ```
+
+不要把这里的认证信息写死成 `root:taosdata`。现场一旦改过 TDengine 账号密码，文档里的验证命令也必须同步使用实际配置。
 
 ### 3.3 必须满足的数据库要求
 
@@ -112,9 +118,13 @@ CREATE DATABASE IF NOT EXISTS mqtt_rule PRECISION 'us';
 可通过 REST 验证：
 
 ```powershell
-$auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('root:taosdata'))
+$taosHost = '192.168.204.128'
+$taosPort = 6041
+$taosUser = '请替换为 nanomq_weld_taos.conf 中实际配置的用户名'
+$taosPassword = '请替换为 nanomq_weld_taos.conf 中实际配置的密码'
+$auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${taosUser}:${taosPassword}"))
 Invoke-WebRequest `
-  -Uri 'http://192.168.204.128:6041/rest/sql' `
+  -Uri "http://${taosHost}:${taosPort}/rest/sql" `
   -Method Post `
   -Headers @{ Authorization = $auth } `
   -Body 'USE mqtt_rule; SHOW STABLES;' `
@@ -178,11 +188,20 @@ rules.taos = [
 
 ## 5. 手工启动 NanoMQ
 
-以管理员 PowerShell 或 CMD 打开：
+以管理员 PowerShell 或 CMD 打开。
+
+如果使用 PowerShell，请执行：
 
 ```powershell
-cd /d "C:\Program Files\NanoMQ TAOS\bin"
+Set-Location "C:\Program Files\NanoMQ TAOS\bin"
 .\nanomq.exe start --conf "C:\Program Files\NanoMQ TAOS\config\nanomq_weld_taos.conf"
+```
+
+如果使用 CMD，请执行：
+
+```cmd
+cd /d "C:\Program Files\NanoMQ TAOS\bin"
+nanomq.exe start --conf "C:\Program Files\NanoMQ TAOS\config\nanomq_weld_taos.conf"
 ```
 
 如果启动成功，通常会看到类似信息：
@@ -194,7 +213,7 @@ cd /d "C:\Program Files\NanoMQ TAOS\bin"
 停止命令：
 
 ```powershell
-cd /d "C:\Program Files\NanoMQ TAOS\bin"
+Set-Location "C:\Program Files\NanoMQ TAOS\bin"
 .\nanomq.exe stop
 ```
 
@@ -247,33 +266,36 @@ netstat -ano | findstr ":8083"
 - Windows 下不要直接把复杂 JSON 长串塞给 `-m`
 - 推荐先写成 UTF-8 文件，再用 `-f`
 - `points[].ts_ms` 必须写真实 epoch 毫秒时间，不能写 `5000` 这种相对值
+- 不建议把测试文件写到 `C:\Program Files\...`，普通运维账号可能没有写权限
 
 在 PowerShell 执行：
 
 ```powershell
 $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $msgId = "msg-env-live-$nowMs"
+$payloadFile = Join-Path $env:TEMP 'payload-env.json'
 $payload = @"
 {"msg_class":"telemetry","gateway_id":"gw3568_01","device_id":"th01","msg_id":"$msgId","spec_ver":"1.0","ts_ms":$nowMs,"seq":52,"device_type":"temp_humidity_transmitter","device_model":"TH-485","signal_type":"environment","quality":{"code":0,"text":"ok"},"source":{"bus":"rs485","port":"ttyS1","protocol":"modbus"},"collect":{"period_ms":1000,"timeout_ms":200,"retries":2},"data":{"point_count":1,"fields":[{"name":"temperature","unit":"C"},{"name":"humidity","unit":"pct_rh"}],"points":[{"ts_ms":$nowMs,"values":[25.1,60.2]}]}}
 "@
 [System.IO.File]::WriteAllText(
-  "C:\Program Files\NanoMQ TAOS\payload-env.json",
+  $payloadFile,
   $payload,
   [System.Text.UTF8Encoding]::new($false)
 )
+$payloadFile
 ```
 
 ### 8.2 发布测试消息
 
 ```powershell
-cd /d "C:\Program Files\NanoMQ TAOS\bin"
+Set-Location "C:\Program Files\NanoMQ TAOS\bin"
 .\nanomq_cli.exe pub `
   -h 127.0.0.1 `
   -p 1883 `
   -q 1 `
   -i "ops-test-client" `
   -t "weld/v1/sz01/line_01/station_03/gw3568_01/telemetry/env/th01" `
-  -f "C:\Program Files\NanoMQ TAOS\payload-env.json"
+  -f $payloadFile
 ```
 
 如果客户端连接成功，通常会看到：
@@ -287,9 +309,13 @@ connect_cb: mqtt-tcp://127.0.0.1:1883 connect result: 0
 ### 9.1 查计数
 
 ```powershell
-$auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('root:taosdata'))
+$taosHost = '192.168.204.128'
+$taosPort = 6041
+$taosUser = '请替换为 nanomq_weld_taos.conf 中实际配置的用户名'
+$taosPassword = '请替换为 nanomq_weld_taos.conf 中实际配置的密码'
+$auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${taosUser}:${taosPassword}"))
 Invoke-WebRequest `
-  -Uri 'http://192.168.204.128:6041/rest/sql' `
+  -Uri "http://${taosHost}:${taosPort}/rest/sql" `
   -Method Post `
   -Headers @{ Authorization = $auth } `
   -Body 'SELECT COUNT(*) FROM mqtt_rule.weld_env_point;' `
@@ -302,9 +328,13 @@ Select-Object -ExpandProperty Content
 将上一步生成的 `$msgId` 替换进 SQL：
 
 ```powershell
-$auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('root:taosdata'))
+$taosHost = '192.168.204.128'
+$taosPort = 6041
+$taosUser = '请替换为 nanomq_weld_taos.conf 中实际配置的用户名'
+$taosPassword = '请替换为 nanomq_weld_taos.conf 中实际配置的密码'
+$auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${taosUser}:${taosPassword}"))
 Invoke-WebRequest `
-  -Uri 'http://192.168.204.128:6041/rest/sql' `
+  -Uri "http://${taosHost}:${taosPort}/rest/sql" `
   -Method Post `
   -Headers @{ Authorization = $auth } `
   -Body "SELECT msg_id, topic_name, temperature, humidity FROM mqtt_rule.weld_env_point WHERE msg_id = 'msg-env-live-xxxxxxxxxxxxx';" `
@@ -356,6 +386,39 @@ Test-NetConnection 192.168.204.128 -Port 6041
 如果 `nanomq_cli pub` 都连不上，那不是 TAOS 问题，而是 broker 没起、端口不对，或被防火墙挡住。
 
 ### 10.5 再看 NanoMQ 日志
+
+当前默认焊接配置里是：
+
+```hocon
+log {
+    to = [console]
+    level = info
+}
+```
+
+这意味着：
+
+- 手工前台启动时，日志直接打印在当前控制台
+- 如果通过计划任务自启动，默认不会自动给你一个可见控制台
+
+所以现场排障时，建议先临时结束计划任务拉起的进程，再前台手工启动一次观察日志：
+
+```powershell
+schtasks /End /TN "NanoMQ TAOS Autostart"
+Set-Location "C:\Program Files\NanoMQ TAOS\bin"
+.\nanomq.exe start --conf "C:\Program Files\NanoMQ TAOS\config\nanomq_weld_taos.conf"
+```
+
+如果现场不方便前台运行，至少先把配置改成文件日志，例如：
+
+```hocon
+log {
+    to = [console, file]
+    level = info
+    dir = "C:\\Program Files\\NanoMQ TAOS\\log"
+    file = "nanomq.log"
+}
+```
 
 重点关注这些日志：
 
